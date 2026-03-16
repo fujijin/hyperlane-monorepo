@@ -21,16 +21,16 @@ Single unified struct for all quote types:
 ```solidity
 struct SignedQuote {
     bytes context;      // ABI-encoded calldata (keys for storage lookup)
-    bytes data;         // quote payload — contract-specific encoding
+    bytes32 data;       // quote payload — single slot, contract-specific encoding
     uint48 issuedAt;    // ordering for standing quotes
     uint48 expiry;      // == issuedAt means transient
 }
 ```
 
-**Quote data formats** (contract-specific):
+**Quote data formats** (`bytes32`, contract-specific packing):
 
-- **IGP**: `abi.encode(uint128 tokenExchangeRate, uint128 gasPrice)` — packs into a single slot. Fee computed as `gasLimit * gasPrice * tokenExchangeRate / SCALE`, preserving variable gasLimit support.
-- **Warp fee**: `abi.encode(uint256 fee)` — flat fee amount. Single slot.
+- **IGP**: `bytes32((uint256(tokenExchangeRate) << 128) | uint256(gasPrice))` — two `uint128` values packed in one word. Fee computed as `gasLimit * gasPrice * tokenExchangeRate / SCALE`, preserving variable gasLimit support.
+- **Warp fee**: `bytes32(uint256(fee))` — flat fee amount. `bytes32(0)` is invalid (zero fee = no quote).
 
 **Transient vs standing**:
 
@@ -93,20 +93,20 @@ mapping(uint32 => mapping(bytes32 => StoredQuote)) public quotes;
 ```
 AbstractOffchainQuoter (abstract, EIP712)
   ├── EIP-712 signature verification
-  ├── unified submitQuote() — routes transient (tstore) vs standing (sstore)
-  ├── abstract _storeStanding() / _tstore() / _tload()
+  ├── unified submitQuote() — verifies sig + expiry, routes transient vs standing
+  ├── abstract _storeTransient() / _storeStanding()
   └── admin: quoteSigner, urls
 
 OffchainQuotedFee is AbstractOffchainQuoter, ITokenFee
   ├── quotes[destination][recipient] nested mapping
-  ├── data = uint256 fee
+  ├── data = bytes32(fee)
   ├── resolution: transient → specific → destination-only → recipient-only → CCIP-Read
   ├── quoteTransferRemote() → resolves and returns Quote[]
   └── claim() for fee collection
 
 OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook
   ├── quotes[destination][sender] nested mapping
-  ├── data = (uint128 tokenExchangeRate, uint128 gasPrice)
+  ├── data = bytes32(rate << 128 | gasPrice)
   ├── fallback: delegates to existing IGP (StorageGasOracle)
   ├── resolution: transient → specific → destination-only → sender-only → IGP
   ├── _quoteDispatch() → resolves and computes gasLimit * gasPrice * rate
@@ -129,7 +129,7 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
     string[] internal _urls;
 
     struct StoredQuote {
-        bytes data;         // contract-specific payload
+        bytes32 data;       // contract-specific payload (fixed size, single slot)
         uint48 issuedAt;
         uint48 expiry;
     }
@@ -139,29 +139,24 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
     ) external {
         require(uint48(block.timestamp) <= sq.expiry, "expired");
         _verifySigner(sq, signature);
-
         if (sq.expiry == sq.issuedAt) {
-            // Transient — tstore (tx-scoped, auto-clears)
-            _tstoreQuote(sq);
+            _storeTransient(sq);
         } else {
-            // Standing — regular storage
             _storeStanding(sq);
         }
     }
 
-    // --- Abstract: concrete contracts implement storage ---
+    // --- Abstract: concrete contracts implement each storage path ---
+    function _storeTransient(SignedQuote calldata sq) internal virtual;
     function _storeStanding(SignedQuote calldata sq) internal virtual;
-    function _tstoreQuote(SignedQuote calldata sq) internal virtual;
-    function _tloadQuote() internal view virtual returns (bytes memory data, bool found);
 
     // --- Standing helper ---
     function _resolveStored(StoredQuote storage sq)
-        internal view returns (bytes memory data, bool found)
+        internal view returns (bytes32 data, bool found)
     {
         if (sq.expiry > 0 && uint48(block.timestamp) <= sq.expiry) {
             return (sq.data, true);
         }
-        return (data, false);
     }
 
     // --- Admin ---
@@ -178,27 +173,10 @@ contract OffchainQuotedFee is AbstractOffchainQuoter, ITokenFee {
     bytes32 constant WILDCARD_RECIPIENT = type(bytes32).max;
 
     mapping(uint32 => mapping(bytes32 => StoredQuote)) public quotes;
+    bytes32 transient _transientData;
 
-    // Transient storage: single uint256 fee slot
-    uint256 constant TRANSIENT_FEE_SLOT = uint256(keccak256("OffchainQuotedFee.transientFee"));
-    uint256 constant TRANSIENT_HAS_SLOT = uint256(keccak256("OffchainQuotedFee.hasTransient"));
-
-    function _tstoreQuote(SignedQuote calldata sq) internal override {
-        uint256 fee = abi.decode(sq.data, (uint256));
-        assembly {
-            tstore(TRANSIENT_FEE_SLOT, fee)
-            tstore(TRANSIENT_HAS_SLOT, 1)
-        }
-    }
-
-    function _tloadQuote() internal view override returns (bytes memory data, bool found) {
-        uint256 has; uint256 fee;
-        assembly {
-            has := tload(TRANSIENT_HAS_SLOT)
-            fee := tload(TRANSIENT_FEE_SLOT)
-        }
-        if (has == 1) return (abi.encode(fee), true);
-        return (data, false);
+    function _storeTransient(SignedQuote calldata sq) internal override {
+        _transientData = sq.data;
     }
 
     function _storeStanding(SignedQuote calldata sq) internal override {
@@ -209,37 +187,31 @@ contract OffchainQuotedFee is AbstractOffchainQuoter, ITokenFee {
         quotes[dest][recipient] = StoredQuote(sq.data, sq.issuedAt, sq.expiry);
     }
 
+    function _decodeFee(bytes32 data) internal pure returns (uint256) {
+        return uint256(data);
+    }
+
     function quoteTransferRemote(uint32 _destination, bytes32 _recipient, uint256)
         external view returns (Quote[] memory result)
     {
-        uint256 fee;
+        bytes32 data;
         bool found;
 
-        // 1. Transient
-        (bytes memory data, bool tFound) = _tloadQuote();
-        if (tFound) { fee = abi.decode(data, (uint256)); found = true; }
+        // 1. Transient (tx-scoped)
+        if (_transientData != 0) { data = _transientData; found = true; }
 
         // 2. Specific: destination + recipient
-        if (!found) {
-            (data, found) = _resolveStored(quotes[_destination][_recipient]);
-            if (found) fee = abi.decode(data, (uint256));
-        }
+        if (!found) (data, found) = _resolveStored(quotes[_destination][_recipient]);
 
         // 3. Destination-only
-        if (!found) {
-            (data, found) = _resolveStored(quotes[_destination][WILDCARD_RECIPIENT]);
-            if (found) fee = abi.decode(data, (uint256));
-        }
+        if (!found) (data, found) = _resolveStored(quotes[_destination][WILDCARD_RECIPIENT]);
 
         // 4. Recipient-only
-        if (!found) {
-            (data, found) = _resolveStored(quotes[WILDCARD_DEST][_recipient]);
-            if (found) fee = abi.decode(data, (uint256));
-        }
+        if (!found) (data, found) = _resolveStored(quotes[WILDCARD_DEST][_recipient]);
 
         if (found) {
             result = new Quote[](1);
-            result[0] = Quote(token(), fee);
+            result[0] = Quote(token(), _decodeFee(data));
             return result;
         }
 
@@ -262,38 +234,16 @@ contract OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook 
     address constant WILDCARD_SENDER = address(type(uint160).max);
 
     mapping(uint32 => mapping(address => StoredQuote)) public quotes;
+    bytes32 transient _transientData;
 
     InterchainGasPaymaster public immutable igp;
-
-    // Transient storage: (uint128 tokenExchangeRate, uint128 gasPrice) packed in one slot
-    uint256 constant TRANSIENT_DATA_SLOT = uint256(keccak256("OffchainQuotedHook.transientData"));
-    uint256 constant TRANSIENT_HAS_SLOT = uint256(keccak256("OffchainQuotedHook.hasTransient"));
 
     constructor(address _igp, ...) {
         igp = InterchainGasPaymaster(_igp);
     }
 
-    function _tstoreQuote(SignedQuote calldata sq) internal override {
-        (uint128 rate, uint128 gasPrice) = abi.decode(sq.data, (uint128, uint128));
-        uint256 packed = (uint256(rate) << 128) | uint256(gasPrice);
-        assembly {
-            tstore(TRANSIENT_DATA_SLOT, packed)
-            tstore(TRANSIENT_HAS_SLOT, 1)
-        }
-    }
-
-    function _tloadQuote() internal view override returns (bytes memory data, bool found) {
-        uint256 has; uint256 packed;
-        assembly {
-            has := tload(TRANSIENT_HAS_SLOT)
-            packed := tload(TRANSIENT_DATA_SLOT)
-        }
-        if (has == 1) {
-            uint128 rate = uint128(packed >> 128);
-            uint128 gasPrice = uint128(packed);
-            return (abi.encode(rate, gasPrice), true);
-        }
-        return (data, false);
+    function _storeTransient(SignedQuote calldata sq) internal override {
+        _transientData = sq.data;
     }
 
     function _storeStanding(SignedQuote calldata sq) internal override {
@@ -304,9 +254,10 @@ contract OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook 
         quotes[dest][sender] = StoredQuote(sq.data, sq.issuedAt, sq.expiry);
     }
 
-    /// @notice Compute fee from (tokenExchangeRate, gasPrice) and gasLimit
-    function _computeFee(bytes memory data, uint256 gasLimit) internal pure returns (uint256) {
-        (uint128 rate, uint128 gasPrice) = abi.decode(data, (uint128, uint128));
+    /// @notice Decode (tokenExchangeRate, gasPrice) packed in bytes32
+    function _computeFee(bytes32 data, uint256 gasLimit) internal pure returns (uint256) {
+        uint128 rate = uint128(uint256(data) >> 128);
+        uint128 gasPrice = uint128(uint256(data));
         return (gasLimit * uint256(gasPrice) * uint256(rate)) / 1e10;
     }
 
@@ -316,10 +267,11 @@ contract OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook 
         uint256 gasLimit = metadata.gasLimit(igp.DEFAULT_GAS_USAGE());
         address sender = message.senderAddress();
         uint32 dest = message.destination();
+        bytes32 data;
+        bool found;
 
         // 1. Transient
-        (bytes memory data, bool found) = _tloadQuote();
-        if (found) return _computeFee(data, gasLimit);
+        if (_transientData != 0) return _computeFee(_transientData, gasLimit);
 
         // 2. Specific: destination + sender
         (data, found) = _resolveStored(quotes[dest][sender]);
@@ -346,7 +298,7 @@ contract OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook 
         uint32 dest = message.destination();
 
         // Check if any offchain quote matched
-        (, bool found) = _tloadQuote();
+        bool found = _transientData != 0;
         if (!found) (, found) = _resolveStored(quotes[dest][sender]);
         if (!found) (, found) = _resolveStored(quotes[dest][WILDCARD_SENDER]);
         if (!found) (, found) = _resolveStored(quotes[WILDCARD_DEST][sender]);
@@ -558,13 +510,13 @@ Can be one service or two independent services:
 **Warp fee service** (operated by warp route owner):
 
 - Computes protocol margin based on `(sender, clientId, amount, destination)`
-- Signs quotes with `data = abi.encode(uint256 fee)`
+- Signs quotes with `data = bytes32(fee)`
 - EIP-712 domain points to `OffchainQuotedFee` contract address
 
 **Gas fee service** (operated by relayer):
 
 - Fetches real-time gas prices, exchange rates from destination chain
-- Signs quotes with `data = abi.encode(uint128 tokenExchangeRate, uint128 gasPrice)`
+- Signs quotes with `data = bytes32(rate << 128 | gasPrice)`
 - Signs destination-only quotes periodically (auto-expiring, replaces manual StorageGasOracle updates)
 - Signs sender-specific quotes for negotiated rates
 - Signs transient quotes on-demand for real-time pricing
