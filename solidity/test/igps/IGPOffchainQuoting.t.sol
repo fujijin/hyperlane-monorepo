@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+
+import {InterchainGasPaymaster} from "../../contracts/hooks/igp/InterchainGasPaymaster.sol";
+import {AbstractOffchainQuoter} from "../../contracts/libs/AbstractOffchainQuoter.sol";
+import {StorageGasOracle} from "../../contracts/hooks/igp/StorageGasOracle.sol";
+import {IGasOracle} from "../../contracts/interfaces/IGasOracle.sol";
+import {StandardHookMetadata} from "../../contracts/hooks/libs/StandardHookMetadata.sol";
+import {TypeCasts} from "../../contracts/libs/TypeCasts.sol";
+import {MessageUtils} from "../isms/IsmTestUtils.sol";
+
+contract IGPOffchainQuotingTest is Test {
+    using TypeCasts for address;
+    using MessageUtils for bytes;
+
+    InterchainGasPaymaster igp;
+    StorageGasOracle oracle;
+
+    uint256 signerPk = 0xA11CE;
+    address signer;
+
+    address constant BENEFICIARY = address(0x444);
+    uint32 constant DEST = 11111;
+    uint32 constant ORIGIN = 22222;
+    uint256 constant GAS_LIMIT = 300_000;
+    uint96 constant GAS_OVERHEAD = 123_000;
+
+    uint128 constant EXCHANGE_RATE = 2e10; // 2.0
+    uint128 constant GAS_PRICE = 150;
+
+    // quoteGasPayment(address,uint32,uint256) selector
+    bytes4 constant QUOTE_CONTEXT_SELECTOR =
+        bytes4(keccak256("quoteGasPayment(address,uint32,uint256)"));
+
+    function setUp() public {
+        signer = vm.addr(signerPk);
+
+        igp = new InterchainGasPaymaster();
+        igp.initialize(address(this), BENEFICIARY);
+
+        oracle = new StorageGasOracle();
+        _setGasConfig(DEST, oracle, GAS_OVERHEAD);
+        _setOracleData(DEST, 1e10, 100); // 1.0 exchange, 100 wei gas price
+
+        igp.setOffchainQuoteSigner(signer);
+    }
+
+    // ============ Helpers ============
+
+    function _domainSeparator() internal view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256(
+                        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                    ),
+                    keccak256("OffchainQuoter"),
+                    keccak256("1"),
+                    block.chainid,
+                    address(igp)
+                )
+            );
+    }
+
+    function _signQuote(
+        AbstractOffchainQuoter.SignedQuote memory sq
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                igp.SIGNED_QUOTE_TYPEHASH(),
+                keccak256(sq.context),
+                sq.data,
+                sq.issuedAt,
+                sq.expiry
+            )
+        );
+        bytes32 digest = ECDSA.toTypedDataHash(_domainSeparator(), structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _packGasData(
+        uint128 rate,
+        uint128 gasPrice
+    ) internal pure returns (bytes32) {
+        return bytes32((uint256(rate) << 128) | uint256(gasPrice));
+    }
+
+    function _igpContext(
+        address feeToken,
+        uint32 dest,
+        address sender_
+    ) internal pure returns (bytes memory) {
+        return
+            abi.encodeWithSelector(
+                QUOTE_CONTEXT_SELECTOR,
+                feeToken,
+                dest,
+                sender_
+            );
+    }
+
+    function _submitTransient(
+        address feeToken,
+        uint32 dest,
+        address sender_,
+        uint128 rate,
+        uint128 gasPrice
+    ) internal {
+        uint48 now_ = uint48(block.timestamp);
+        AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
+            .SignedQuote({
+                context: _igpContext(feeToken, dest, sender_),
+                data: _packGasData(rate, gasPrice),
+                issuedAt: now_,
+                expiry: now_ // transient
+            });
+        igp.submitQuote(sq, _signQuote(sq));
+    }
+
+    function _submitStanding(
+        uint32 dest,
+        address sender_,
+        uint128 rate,
+        uint128 gasPrice,
+        uint48 issuedAt,
+        uint48 expiry
+    ) internal {
+        AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
+            .SignedQuote({
+                context: abi.encodeWithSelector(
+                    QUOTE_CONTEXT_SELECTOR,
+                    dest,
+                    sender_
+                ),
+                data: _packGasData(rate, gasPrice),
+                issuedAt: issuedAt,
+                expiry: expiry
+            });
+        igp.submitQuote(sq, _signQuote(sq));
+    }
+
+    function _setGasConfig(
+        uint32 domain,
+        IGasOracle gasOracle,
+        uint96 overhead
+    ) internal {
+        InterchainGasPaymaster.GasParam[]
+            memory params = new InterchainGasPaymaster.GasParam[](1);
+        params[0] = InterchainGasPaymaster.GasParam(
+            domain,
+            InterchainGasPaymaster.DomainGasConfig(gasOracle, overhead)
+        );
+        igp.setDestinationGasConfigs(params);
+    }
+
+    function _setOracleData(
+        uint32 domain,
+        uint128 rate,
+        uint128 gasPrice
+    ) internal {
+        oracle.setRemoteGasData(
+            StorageGasOracle.RemoteGasDataConfig({
+                remoteDomain: domain,
+                tokenExchangeRate: rate,
+                gasPrice: gasPrice
+            })
+        );
+    }
+
+    // ============ Transient Quotes ============
+
+    function test_transientQuote_overridesOracle() public {
+        // Oracle: rate=1e10, gasPrice=100 → fee = 300000 * 100 * 1e10 / 1e10 = 30000000
+        uint256 oracleFee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(oracleFee, 30_000_000);
+
+        // Submit transient with different rate/price
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE
+        );
+
+        // Offchain: rate=2e10, gasPrice=150 → fee = 300000 * 150 * 2e10 / 1e10 = 90000000
+        uint256 offchainFee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(offchainFee, 90_000_000);
+    }
+
+    function test_transientQuote_contextMismatch_fallsToOracle() public {
+        // Submit transient for DEST
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE
+        );
+
+        // Query for different destination — falls through to oracle
+        uint32 otherDest = DEST + 1;
+        _setGasConfig(otherDest, oracle, GAS_OVERHEAD);
+        _setOracleData(otherDest, 1e10, 100);
+
+        uint256 fee = igp.quoteGasPayment(otherDest, GAS_LIMIT);
+        assertEq(fee, 30_000_000); // oracle price, not offchain
+    }
+
+    function test_transientQuote_senderMismatch_fallsToOracle() public {
+        // Submit transient for address(this)
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE
+        );
+
+        // Query from different sender
+        vm.prank(address(0xBEEF));
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 30_000_000); // oracle price
+    }
+
+    function test_transientQuote_feeTokenMismatch_fallsToOracle() public {
+        // Submit transient for native (address(0))
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE
+        );
+
+        // Query with ERC20 fee token — context hash won't match
+        // Need to set up a token oracle first
+        address tokenAddr = address(0xFEE);
+        StorageGasOracle tokenOracle = new StorageGasOracle();
+        InterchainGasPaymaster.TokenGasOracleConfig[]
+            memory configs = new InterchainGasPaymaster.TokenGasOracleConfig[](
+                1
+            );
+        configs[0] = InterchainGasPaymaster.TokenGasOracleConfig(
+            tokenAddr,
+            DEST,
+            tokenOracle
+        );
+        igp.setTokenGasOracles(configs);
+        tokenOracle.setRemoteGasData(
+            StorageGasOracle.RemoteGasDataConfig({
+                remoteDomain: DEST,
+                tokenExchangeRate: 1e10,
+                gasPrice: 100
+            })
+        );
+
+        uint256 fee = igp.quoteGasPayment(tokenAddr, DEST, GAS_LIMIT);
+        assertEq(fee, 30_000_000); // token oracle price, not offchain
+    }
+
+    function test_transientQuote_clearedAfterPostDispatch() public {
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE
+        );
+
+        // Verify transient is active
+        uint256 offchainFee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(offchainFee, 90_000_000);
+
+        // postDispatch consumes and clears transient
+        bytes memory message = MessageUtils.formatMessage(
+            0,
+            0,
+            ORIGIN,
+            address(this).addressToBytes32(),
+            DEST,
+            address(0x1).addressToBytes32(),
+            "hello"
+        );
+        bytes memory metadata = StandardHookMetadata.overrideGasLimit(
+            GAS_LIMIT
+        );
+
+        // Re-submit transient for postDispatch (it will quote internally)
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE
+        );
+        uint256 quote = igp.quoteDispatch(metadata, message);
+        vm.deal(address(this), quote);
+        igp.postDispatch{value: quote}(metadata, message);
+
+        // After postDispatch, transient should be cleared → falls to oracle
+        uint256 feeAfter = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(feeAfter, 30_000_000); // oracle
+    }
+
+    // ============ Standing Quotes ============
+
+    function test_standingQuote_specificMatch() public {
+        uint48 now_ = uint48(block.timestamp);
+        _submitStanding(
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 90_000_000);
+    }
+
+    function test_standingQuote_wildcardSender() public {
+        uint48 now_ = uint48(block.timestamp);
+        address wildcard = address(type(uint160).max);
+        _submitStanding(
+            DEST,
+            wildcard,
+            EXCHANGE_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 90_000_000);
+    }
+
+    function test_standingQuote_wildcardDest() public {
+        uint48 now_ = uint48(block.timestamp);
+        uint32 wildcardDest = type(uint32).max;
+        _submitStanding(
+            wildcardDest,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 90_000_000);
+    }
+
+    function test_standingQuote_expired_fallsToOracle() public {
+        uint48 now_ = uint48(block.timestamp);
+        _submitStanding(
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 1
+        );
+
+        vm.warp(now_ + 2);
+
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 30_000_000); // oracle
+    }
+
+    function test_standingQuote_staleRejected() public {
+        uint48 now_ = uint48(block.timestamp);
+        _submitStanding(
+            DEST,
+            address(this),
+            EXCHANGE_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        // Older issuedAt should revert
+        AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
+            .SignedQuote({
+                context: abi.encodeWithSelector(
+                    QUOTE_CONTEXT_SELECTOR,
+                    DEST,
+                    address(this)
+                ),
+                data: _packGasData(3e10, 200),
+                issuedAt: now_ - 1,
+                expiry: now_ + 7200
+            });
+        bytes memory sig = _signQuote(sq);
+        vm.expectRevert(AbstractOffchainQuoter.StaleQuote.selector);
+        igp.submitQuote(sq, sig);
+    }
+
+    // ============ Priority ============
+
+    function test_transientOverStanding() public {
+        uint48 now_ = uint48(block.timestamp);
+        uint128 standingRate = 1e10;
+        uint128 transientRate = 5e10;
+
+        _submitStanding(
+            DEST,
+            address(this),
+            standingRate,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+        _submitTransient(
+            address(0),
+            DEST,
+            address(this),
+            transientRate,
+            GAS_PRICE
+        );
+
+        // transientRate=5e10 → 300000 * 150 * 5e10 / 1e10 = 225000000
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 225_000_000);
+    }
+
+    function test_specificOverWildcard() public {
+        uint48 now_ = uint48(block.timestamp);
+        uint128 wildcardRate = 1e10;
+        uint128 specificRate = 3e10;
+
+        address wildcard = address(type(uint160).max);
+        _submitStanding(
+            DEST,
+            wildcard,
+            wildcardRate,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+        _submitStanding(
+            DEST,
+            address(this),
+            specificRate,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        // specificRate=3e10 → 300000 * 150 * 3e10 / 1e10 = 135000000
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 135_000_000);
+    }
+
+    // ============ Signature ============
+
+    function test_invalidSigner_reverts() public {
+        uint256 wrongPk = 0xBAD;
+        uint48 now_ = uint48(block.timestamp);
+
+        AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
+            .SignedQuote({
+                context: abi.encodeWithSelector(
+                    QUOTE_CONTEXT_SELECTOR,
+                    DEST,
+                    address(this)
+                ),
+                data: _packGasData(EXCHANGE_RATE, GAS_PRICE),
+                issuedAt: now_,
+                expiry: now_
+            });
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                igp.SIGNED_QUOTE_TYPEHASH(),
+                keccak256(sq.context),
+                sq.data,
+                sq.issuedAt,
+                sq.expiry
+            )
+        );
+        bytes32 digest = ECDSA.toTypedDataHash(_domainSeparator(), structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongPk, digest);
+
+        vm.expectRevert(AbstractOffchainQuoter.InvalidSigner.selector);
+        igp.submitQuote(sq, abi.encodePacked(r, s, v));
+    }
+
+    function test_setOffchainQuoteSigner_onlyOwner() public {
+        vm.prank(address(0xBEEF));
+        vm.expectRevert("Ownable: caller is not the owner");
+        igp.setOffchainQuoteSigner(address(0x123));
+    }
+
+    // ============ Fee math ============
+
+    function test_computeGasFee(
+        uint64 rate,
+        uint64 gasPrice,
+        uint64 gasLimit
+    ) public {
+        // Ensure fee is non-zero so standing quote doesn't fall through
+        vm.assume(rate > 0 && gasPrice > 0 && gasLimit > 0);
+        vm.assume(
+            uint256(gasLimit) * uint256(gasPrice) * uint256(rate) >= 1e10
+        );
+
+        uint48 now_ = uint48(block.timestamp);
+        _submitStanding(
+            DEST,
+            address(this),
+            uint128(rate),
+            uint128(gasPrice),
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(DEST, gasLimit);
+        uint256 expected = (uint256(gasLimit) *
+            uint256(gasPrice) *
+            uint256(rate)) / 1e10;
+        assertEq(fee, expected);
+    }
+
+    receive() external payable {}
+}

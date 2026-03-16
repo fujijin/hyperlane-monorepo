@@ -20,6 +20,7 @@ import {IGasOracle} from "../../interfaces/IGasOracle.sol";
 import {IInterchainGasPaymaster} from "../../interfaces/IInterchainGasPaymaster.sol";
 import {IPostDispatchHook} from "../../interfaces/hooks/IPostDispatchHook.sol";
 import {AbstractPostDispatchHook} from "../libs/AbstractPostDispatchHook.sol";
+import {AbstractOffchainQuoter} from "../../libs/AbstractOffchainQuoter.sol";
 import {Indexed} from "../../libs/Indexed.sol";
 import {EnumerableDomainSet} from "../../libs/EnumerableDomainSet.sol";
 
@@ -41,6 +42,7 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 contract InterchainGasPaymaster is
     IInterchainGasPaymaster,
     AbstractPostDispatchHook,
+    AbstractOffchainQuoter,
     IGasOracle,
     Indexed,
     OwnableUpgradeable,
@@ -76,6 +78,34 @@ contract InterchainGasPaymaster is
     /// @dev This replaces the gasOverhead field from destinationGasConfigs.
     mapping(uint32 destinationDomain => uint256 gasOverhead)
         public destinationGasOverhead;
+
+    // ============ Offchain Quoting Storage ============
+    // Appended after existing storage — safe for upgradeable proxy.
+
+    uint32 constant WILDCARD_DEST = type(uint32).max;
+    address constant WILDCARD_SENDER = address(type(uint160).max);
+
+    /// @dev Selector used as context prefix for transient quote hashing.
+    bytes4 constant QUOTE_CONTEXT_SELECTOR =
+        bytes4(keccak256("quoteGasPayment(address,uint32,uint256)"));
+
+    struct StoredGasQuote {
+        uint128 tokenExchangeRate; // slot 1
+        uint128 gasPrice; // slot 1
+        uint48 issuedAt; // slot 2
+        uint48 expiry; // slot 2
+    }
+
+    /// @notice Offchain quote signer
+    address public offchainQuoteSigner;
+
+    /// @notice Standing offchain quotes: offchainQuotes[destination][sender]
+    mapping(uint32 => mapping(address => StoredGasQuote)) public offchainQuotes;
+
+    /// @dev Transient quote — tx-scoped, auto-clears. 0 exchangeRate = no quote.
+    uint128 private transient _transientExchangeRate;
+    uint128 private transient _transientGasPrice;
+    bytes32 private transient _transientContextHash;
 
     // ============ Events ============
 
@@ -285,8 +315,8 @@ contract InterchainGasPaymaster is
 
     /**
      * @notice Quotes the amount of a specific token required to pay for gas.
-     * @dev Uses tokenGasOracles for oracle lookup and destinationGasOverhead for overhead.
-     *      Use NATIVE_TOKEN (address(0)) for native gas payments.
+     * @dev Checks offchain quotes first (transient → specific → destination-only →
+     *      sender-only), then falls back to tokenGasOracles.
      * @param _feeToken The token to pay gas fees in, or NATIVE_TOKEN for native.
      * @param _destinationDomain The domain of the message's destination chain.
      * @param _gasLimit The amount of destination gas to pay for.
@@ -297,6 +327,62 @@ contract InterchainGasPaymaster is
         uint32 _destinationDomain,
         uint256 _gasLimit
     ) public view virtual returns (uint256) {
+        // 1. Transient offchain quote — verify context hash matches
+        if (
+            _transientExchangeRate != 0 &&
+            _transientContextHash ==
+            keccak256(
+                abi.encodeWithSelector(
+                    QUOTE_CONTEXT_SELECTOR,
+                    _feeToken,
+                    _destinationDomain,
+                    msg.sender
+                )
+            )
+        )
+            return
+                _computeGasFee(
+                    _transientExchangeRate,
+                    _transientGasPrice,
+                    _gasLimit
+                );
+
+        // 2-4. Standing offchain quotes
+        uint256 fee = _resolveGasQuote(
+            offchainQuotes[_destinationDomain][msg.sender],
+            _gasLimit
+        );
+        if (fee != 0) return fee;
+
+        fee = _resolveGasQuote(
+            offchainQuotes[_destinationDomain][WILDCARD_SENDER],
+            _gasLimit
+        );
+        if (fee != 0) return fee;
+
+        fee = _resolveGasQuote(
+            offchainQuotes[WILDCARD_DEST][msg.sender],
+            _gasLimit
+        );
+        if (fee != 0) return fee;
+
+        // 5. Fall back to existing oracle
+        return
+            _quoteGasPaymentFromOracle(
+                _feeToken,
+                _destinationDomain,
+                _gasLimit
+            );
+    }
+
+    /**
+     * @notice Original oracle-based gas payment quote.
+     */
+    function _quoteGasPaymentFromOracle(
+        address _feeToken,
+        uint32 _destinationDomain,
+        uint256 _gasLimit
+    ) internal view returns (uint256) {
         IGasOracle _oracle = tokenGasOracles[_feeToken][_destinationDomain];
         require(
             address(_oracle) != address(0),
@@ -310,6 +396,28 @@ contract InterchainGasPaymaster is
         uint256 _destinationGasCost = _gasLimit * uint256(_gasPrice);
         return
             (_destinationGasCost * _tokenExchangeRate) /
+            TOKEN_EXCHANGE_RATE_SCALE;
+    }
+
+    /// @notice Resolve a standing gas quote if not expired, compute fee
+    function _resolveGasQuote(
+        StoredGasQuote storage sq,
+        uint256 gasLimit
+    ) internal view returns (uint256) {
+        if (sq.expiry > 0 && uint48(block.timestamp) <= sq.expiry) {
+            return _computeGasFee(sq.tokenExchangeRate, sq.gasPrice, gasLimit);
+        }
+        return 0;
+    }
+
+    /// @notice Compute fee from exchange rate, gas price, and gas limit
+    function _computeGasFee(
+        uint128 tokenExchangeRate,
+        uint128 gasPrice,
+        uint256 gasLimit
+    ) internal pure returns (uint256) {
+        return
+            (gasLimit * uint256(gasPrice) * uint256(tokenExchangeRate)) /
             TOKEN_EXCHANGE_RATE_SCALE;
     }
 
@@ -449,6 +557,11 @@ contract InterchainGasPaymaster is
             _gasLimit
         );
 
+        // Clear transient quote after use to prevent reuse within same tx
+        _transientExchangeRate = 0;
+        _transientGasPrice = 0;
+        _transientContextHash = bytes32(0);
+
         address _payerOrRefundAddress = _feeToken == address(0)
             ? metadata.refundAddress(message.senderAddress())
             : message.senderAddress();
@@ -518,6 +631,47 @@ contract InterchainGasPaymaster is
         }
 
         emit TokenGasOracleSet(_feeToken, _remoteDomain, address(_gasOracle));
+    }
+
+    // ============ Offchain Quoting: AbstractOffchainQuoter implementation ============
+
+    function _quoteSigner() internal view override returns (address) {
+        return offchainQuoteSigner;
+    }
+
+    function _storeTransient(SignedQuote calldata sq) internal override {
+        (uint128 rate, uint128 gasPrice) = _unpackGasData(sq.data);
+        _transientExchangeRate = rate;
+        _transientGasPrice = gasPrice;
+        _transientContextHash = keccak256(sq.context);
+    }
+
+    function _storeStanding(SignedQuote calldata sq) internal override {
+        (uint32 dest, address sender) = abi.decode(
+            sq.context[4:],
+            (uint32, address)
+        );
+        StoredGasQuote storage existing = offchainQuotes[dest][sender];
+        if (sq.issuedAt <= existing.issuedAt) revert StaleQuote();
+        (uint128 rate, uint128 gasPrice) = _unpackGasData(sq.data);
+        offchainQuotes[dest][sender] = StoredGasQuote(
+            rate,
+            gasPrice,
+            sq.issuedAt,
+            sq.expiry
+        );
+    }
+
+    function _unpackGasData(
+        bytes32 data
+    ) internal pure returns (uint128 rate, uint128 gasPrice) {
+        rate = uint128(uint256(data) >> 128);
+        gasPrice = uint128(uint256(data));
+    }
+
+    /// @notice Set the offchain quote signer. Only callable by owner.
+    function setOffchainQuoteSigner(address _signer) external onlyOwner {
+        offchainQuoteSigner = _signer;
     }
 
     /**

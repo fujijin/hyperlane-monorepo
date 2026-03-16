@@ -5,8 +5,8 @@ out = 'out'
 libs = ["dependencies", "lib"]
 test = 'test'
 cache_path = 'forge-cache'
-solc_version = '0.8.22'
-evm_version= 'paris'
+solc_version = '0.8.28'
+evm_version= 'cancun'
 optimizer_runs = 25_000
 fs_permissions = [
     { access = "read", path = "./script/avs/" },
