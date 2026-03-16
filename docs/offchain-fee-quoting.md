@@ -8,30 +8,54 @@ Current warp route fees use onchain-configured models (Linear, Progressive, Regr
 
 **Key requirements**:
 
-- Differential pricing per user/frontend/partner (offchain logic)
-- Independent signatures for IGP and warp fee
+- Differential pricing per user/frontend/partner (entirely offchain logic)
+- Independent signatures for IGP and warp fee (separate signers, services, expiry)
 - Abstract base contract shared by both fee types
+- Strict one-use quote semantics via `consumedQuotes` mapping
+
+## Signed Quote (EIP-712)
+
+```solidity
+struct SignedQuotes {
+    bytes32 quoteId;    // unique, one-use (strict replay prevention)
+    Quote[] quotes;     // array of {token, amount} — returned verbatim
+    uint256 expiry;     // block.timestamp deadline
+    address sender;     // front-running protection
+}
+
+// Existing type from ITokenBridge.sol:
+struct Quote {
+    address token;      // address(0) for native
+    uint256 amount;
+}
+```
+
+Minimal — everything else is implicit:
+
+- **Contract + chain binding**: EIP-712 domain separator includes `(chainId, verifyingContract)`. A signature for `OffchainQuotedFee` at address X is invalid for `OffchainQuotedHook` at address Y.
+- **Fee token**: Determined by the `quotes` array itself (supports multi-token fees natively).
+- **Transfer params** (`destination`, `recipient`, `transferAmount`, `clientId`): Offchain concerns only. The signer prices the quote based on these, but they are not enforced onchain.
 
 ## Architecture
 
 ### Contract Hierarchy
 
 ```
-AbstractOffchainQuoter (abstract)
-  ├── handles EIP-712 signature verification
-  ├── manages consumedQuotes[quoteId] mapping
-  ├── stores/retrieves pending quote amount (set before transfer, cleared after)
+AbstractOffchainQuoter (abstract, EIP712)
+  ├── EIP-712 signature verification
+  ├── consumedQuotes[quoteId] mapping (strict one-use)
+  ├── pending Quote[] storage (set before transfer, cleared after)
   ├── reentrancy guard for quote lifecycle
   └── CCIP-Read OffchainLookup support
 
 OffchainQuotedFee is AbstractOffchainQuoter, ITokenFee
   ├── set as feeRecipient on warp route
-  ├── quoteTransferRemote() → returns pending amount or OffchainLookup
+  ├── quoteTransferRemote() → returns pending quotes or OffchainLookup revert
   └── claim() for fee collection
 
 OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook
   ├── set as hook on warp route (replaces IGP)
-  ├── _quoteDispatch() → returns pending amount
+  ├── _quoteDispatch() → returns sum of pending quote amounts
   ├── _postDispatch() → bypass prevention, clears state
   └── claim() for fee collection
 
@@ -39,7 +63,8 @@ QuotedFeeRouterWrapper
   ├── user entry point (transferRemoteWithQuote)
   ├── calls quotedFee.submitQuote() + quotedHook.submitQuote()
   ├── then calls warpRoute.transferRemote()
-  └── owns token handling (pull from user, approve to warp route)
+  ├── token handling (pull from user, approve to warp route)
+  └── execute() escape hatch for owner
 ```
 
 ### `AbstractOffchainQuoter`
@@ -49,7 +74,6 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
     // --- Storage ---
     address public quoteSigner;
     mapping(bytes32 => bool) public consumedQuotes;
-    uint256 public defaultFee;
     string[] internal _urls;
 
     // --- Mid-transfer state (cleared after use) ---
@@ -58,13 +82,13 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
 
     // --- Signed quote ---
     struct SignedQuotes {
-        bytes32 quoteId;    // unique, one-use
-        Quote[] quotes;     // {token, amount} pairs — returned verbatim
-        uint256 expiry;     // deadline
-        address sender;     // front-running protection
+        bytes32 quoteId;
+        Quote[] quotes;
+        uint256 expiry;
+        address sender;
     }
 
-    // --- Core functions ---
+    // --- Core ---
 
     /// @notice Verify signature, mark quoteId consumed, store pending quotes
     function submitQuote(SignedQuotes calldata sq, bytes calldata signature) external {
@@ -72,8 +96,10 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
         require(block.timestamp <= sq.expiry, "expired");
         require(!consumedQuotes[sq.quoteId], "consumed");
         require(sq.sender == tx.origin, "sender mismatch");
-        // Verify EIP-712 signature (domain separator scopes to this contract)
-        address signer = ECDSA.recover(_hashTypedDataV4(hashSignedQuotes(sq)), signature);
+        address signer = ECDSA.recover(
+            _hashTypedDataV4(_hashSignedQuotes(sq)),
+            signature
+        );
         require(signer == quoteSigner, "invalid signer");
 
         consumedQuotes[sq.quoteId] = true;
@@ -81,26 +107,25 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
         _hasPendingFee = true;
     }
 
-    /// @notice Get pending quotes (for use by quoteTransferRemote / _quoteDispatch)
+    /// @notice Get pending quotes array
     function _getPendingQuotes() internal view returns (Quote[] memory) {
-        return _hasPendingFee ? _pendingQuotes : _defaultQuotes();
+        return _pendingQuotes;
     }
 
-    /// @notice Clear pending state after transfer completes
-    function _clearPendingFee() internal {
-        _pendingFeeAmount = 0;
+    /// @notice Clear all pending state
+    function _clearPending() internal {
+        delete _pendingQuotes;
         _hasPendingFee = false;
     }
 
-    /// @notice Check if there's a pending fee (for bypass prevention)
-    function _requireAndClearPendingFee() internal {
+    /// @notice Require pending fee exists, then clear (bypass prevention)
+    function _requireAndClearPending() internal {
         require(_hasPendingFee, "no pending fee");
-        _clearPendingFee();
+        _clearPending();
     }
 
-    // Admin
+    // --- Admin ---
     function setQuoteSigner(address _signer) external onlyOwner { ... }
-    function setDefaultFee(uint256 _fee) external onlyOwner { ... }
     function setUrls(string[] memory __urls) external onlyOwner { ... }
 }
 ```
@@ -109,12 +134,12 @@ abstract contract AbstractOffchainQuoter is Ownable, EIP712 {
 
 ```solidity
 contract OffchainQuotedFee is AbstractOffchainQuoter, ITokenFee {
+    /// @notice Returns pending quotes during transfer, or reverts with OffchainLookup
     function quoteTransferRemote(uint32, bytes32, uint256)
         external view returns (Quote[] memory)
     {
         if (_hasPendingFee) return _getPendingQuotes();
-        // CCIP-Read fallback
-        revert OffchainLookup(...);
+        revert OffchainLookup(address(this), _urls, _callData(), this.quoteCallback.selector, "");
     }
 
     function claim(address beneficiary) external onlyOwner { ... }
@@ -125,21 +150,23 @@ contract OffchainQuotedFee is AbstractOffchainQuoter, ITokenFee {
 
 ```solidity
 contract OffchainQuotedHook is AbstractOffchainQuoter, AbstractPostDispatchHook {
+    /// @notice Returns sum of pending quote amounts for hook fee
     function _quoteDispatch(bytes calldata, bytes calldata)
         internal view override returns (uint256)
     {
-        // Sum all quote amounts (hook returns single uint256)
+        if (!_hasPendingFee) return 0;
         Quote[] memory quotes = _getPendingQuotes();
         uint256 total;
         for (uint256 i; i < quotes.length; i++) total += quotes[i].amount;
         return total;
     }
 
-    function _postDispatch(bytes calldata metadata, bytes calldata message)
+    /// @notice Bypass prevention — reverts if no quote was submitted
+    function _postDispatch(bytes calldata, bytes calldata message)
         internal override
     {
-        _requireAndClearPendingFee();  // bypass prevention
-        // emit event with message.id() for relayer indexing
+        _requireAndClearPending();
+        emit GasPayment(message.id());
     }
 
     function claim(address beneficiary) external onlyOwner { ... }
@@ -161,14 +188,14 @@ contract QuotedFeeRouterWrapper is Ownable {
         SignedQuotes calldata gasQuote, bytes calldata gasSig,
         uint32 destination, bytes32 recipient, uint256 amount
     ) external payable returns (bytes32) {
-        // 1. Submit both quotes (sets pending fees)
+        // 1. Submit both quotes (sets pending fees on each contract)
         quotedFee.submitQuote(warpQuote, warpSig);
         quotedHook.submitQuote(gasQuote, gasSig);
 
         // 2. Pull tokens from user, approve to warp route
-        // (collateral/synthetic/native handling)
+        // (collateral/synthetic/native handling based on tokenType)
 
-        // 3. Call warp route — internally reads pending fees
+        // 3. Call warp route — internally reads pending fees from both contracts
         bytes memory encoded = abi.encodeWithSelector(
             TokenRouter.transferRemote.selector, destination, recipient, amount
         );
@@ -178,14 +205,20 @@ contract QuotedFeeRouterWrapper is Ownable {
         return abi.decode(ret, (bytes32));
     }
 
-    // Escape hatch
-    function execute(address target, bytes calldata data, uint256 value) external onlyOwner { ... }
+    /// @notice Escape hatch for owner — arbitrary calls without upgradeability
+    function execute(address target, bytes calldata data, uint256 value)
+        external onlyOwner returns (bytes memory)
+    {
+        (bool ok, bytes memory ret) = target.call{value: value}(data);
+        require(ok);
+        return ret;
+    }
 }
 ```
 
-### Sequence Diagrams
+## Sequence Diagrams
 
-#### Quote Discovery (CCIP-Read)
+### Quote Discovery (CCIP-Read)
 
 ```mermaid
 sequenceDiagram
@@ -198,13 +231,13 @@ sequenceDiagram
     QuotedFee-->>Client: revert OffchainLookup(urls, callData, callback, extraData)
 
     Client->>WarpFeeAPI: GET /{sender}/{callData}.json
-    WarpFeeAPI-->>Client: {signedQuotes: {quoteId, quotes, expiry, sender}, signature}
+    WarpFeeAPI-->>Client: {signedQuotes, signature}
 
     Client->>GasFeeAPI: GET /{sender}/{callData}.json
-    GasFeeAPI-->>Client: {signedQuotes: {quoteId, quotes, expiry, sender}, signature}
+    GasFeeAPI-->>Client: {signedQuotes, signature}
 ```
 
-#### Transfer Execution
+### Transfer Execution
 
 ```mermaid
 sequenceDiagram
@@ -220,10 +253,10 @@ sequenceDiagram
     Note over Wrapper: 1. Submit quotes
 
     Wrapper->>QFee: submitQuote(warpQuote, warpSig)
-    Note over QFee: verify EIP-712 sig against quoteSigner<br/>check expiry, quoteId unused, sender<br/>store pendingQuotes, set hasPendingFee
+    Note over QFee: verify EIP-712 sig<br/>check expiry, quoteId unused, sender<br/>mark consumed, store pendingQuotes
 
     Wrapper->>QHook: submitQuote(gasQuote, gasSig)
-    Note over QHook: verify EIP-712 sig against quoteSigner<br/>check expiry, quoteId unused, sender<br/>store pendingQuotes, set hasPendingFee
+    Note over QHook: verify EIP-712 sig<br/>check expiry, quoteId unused, sender<br/>mark consumed, store pendingQuotes
 
     Note over Wrapper: 2. Pull tokens from user & approve
 
@@ -244,14 +277,14 @@ sequenceDiagram
     WarpRoute->>QFee: transfer warp fee
     WarpRoute->>Mailbox: dispatch(message){value: gasFee}
     Mailbox->>QHook: postDispatch(metadata, message)
-    Note over QHook: check hasPendingFee == true<br/>emit GasPayment(messageId)<br/>clear pending state
+    Note over QHook: require hasPendingFee<br/>emit GasPayment(messageId)<br/>clear pending state
     Mailbox-->>WarpRoute: messageId
 
     WarpRoute-->>Wrapper: messageId
     Wrapper-->>User: messageId
 ```
 
-#### Bypass Attempt (Reverts)
+### Bypass Attempt (Reverts)
 
 ```mermaid
 sequenceDiagram
@@ -269,49 +302,56 @@ sequenceDiagram
     WarpRoute--xAttacker: revert
 ```
 
-### Signed Quote (EIP-712)
+## Deployment
 
-```solidity
-struct SignedQuotes {
-    bytes32 quoteId;    // unique, one-use
-    Quote[] quotes;     // array of {token, amount} — directly returned by quoteTransferRemote
-    uint256 expiry;     // deadline
-    address sender;     // front-running protection
-}
-
-// Where Quote is the existing:
-struct Quote {
-    address token;      // address(0) for native
-    uint256 amount;
-}
-```
-
-Signs over the exact `Quote[]` array that gets returned by `quoteTransferRemote()` or consumed by `_quoteDispatch()`. Benefits:
-
-- Multi-token fee support natively (Quote array already supports multiple denominations)
-- Direct passthrough — no translation between signed data and return value
-- Bound to verifying contract via EIP-712 domain separator `(chainId, address(this))` — same struct used for both warp fee and gas fee, naturally scoped to each contract. A signature for `OffchainQuotedFee` at address X is invalid for `OffchainQuotedHook` at address Y.
-
-### Deployment
-
-1. Deploy `OffchainQuotedFee(token, signer, urls)`
+1. Deploy `OffchainQuotedFee(signer, urls)`
 2. Deploy `OffchainQuotedHook(signer, urls)`
 3. Deploy `QuotedFeeRouterWrapper(warpRoute, quotedFee, quotedHook)`
-4. `warpRoute.setFeeRecipient(quotedFee)`
-5. `warpRoute.setHook(quotedHook)`
-6. Grant `submitQuote` access to wrapper (or make it permissionless since quote has sender check)
+4. `warpRoute.setFeeRecipient(address(quotedFee))`
+5. `warpRoute.setHook(address(quotedHook))`
 
-### Relayer Dual-Mode
+Existing warp routes can be "upgraded" to offchain quoting by setting the new fee recipient and hook — no redeployment of the warp route needed.
 
-- **Quoted mode**: `hookType()` == `OFFCHAIN_QUOTED_HOOK`. No IGP check.
-- **IGP mode**: Standard IGP. Business as usual.
+## Relayer Dual-Mode
 
-### Offchain Service(s)
+Relayer detects mode per warp route:
 
-**Warp fee service** (route operator): signs `FeeQuote` for warp margin.
-**Gas fee service** (relayer): signs `FeeQuote` for relay cost + margin.
+- **Quoted mode**: `hookType()` == `OFFCHAIN_QUOTED_HOOK`. Relayer trusts the quoted fee covers gas. No IGP payment check.
+- **IGP mode**: Standard `InterchainGasPaymaster` hook. Business as usual.
 
-Both CCIP-Read compatible, EIP-712 signing, configurable TTL.
+Both modes coexist across different warp routes. This is a relayer config/detection change, not a protocol change.
+
+## Offchain Quoting Service(s)
+
+Can be one service returning both quotes, or two independent services:
+
+**Warp fee service** (operated by warp route owner):
+
+- Computes protocol margin based on `(sender, clientId, amount, destination)`
+- Signs `SignedQuotes` with `warpFeeSigner` key
+- EIP-712 domain points to `OffchainQuotedFee` contract address
+
+**Gas fee service** (operated by relayer):
+
+- Fetches real-time gas prices, exchange rates from destination chain
+- Computes relay cost + margin, accounting for mailbox `requiredHook` fee
+- Signs `SignedQuotes` with `gasFeeSigner` key
+- EIP-712 domain points to `OffchainQuotedHook` contract address
+
+Both services: CCIP-Read compatible HTTP endpoints (`GET /{sender}/{data}.json`), EIP-712 signing, configurable TTL.
+
+## Security Properties
+
+| Property                 | Mechanism                                                   |
+| ------------------------ | ----------------------------------------------------------- |
+| Replay prevention        | `consumedQuotes[quoteId]` mapping (strict one-use)          |
+| Front-running protection | `sender` field in signed quote, checked against `tx.origin` |
+| Cross-contract replay    | EIP-712 domain separator includes `verifyingContract`       |
+| Cross-chain replay       | EIP-712 domain separator includes `chainId`                 |
+| Bypass prevention        | `_postDispatch()` reverts if `hasPendingFee == false`       |
+| Reentrancy               | `_hasPendingFee` flag prevents `submitQuote()` while active |
+| Quote expiry             | `block.timestamp <= expiry` check in `submitQuote()`        |
+| Signer authorization     | `ECDSA.recover` against owner-configured `quoteSigner`      |
 
 ## Files to Create/Modify
 
@@ -324,23 +364,21 @@ Both CCIP-Read compatible, EIP-712 signing, configurable TTL.
 | `solidity/contracts/interfaces/hooks/IPostDispatchHook.sol`      | Modify — add hook type          |
 | `solidity/test/token/OffchainQuoting.t.sol`                      | Create — Forge tests            |
 
-## Key Files to Reference
+## Key References
 
 - `solidity/contracts/token/extensions/PredicateRouterWrapper.sol` — wrapper pattern
 - `solidity/contracts/isms/ccip-read/AbstractCcipReadIsm.sol` — OffchainLookup pattern
 - `solidity/contracts/hooks/igp/InterchainGasPaymaster.sol` — IGP hook model
-- `solidity/contracts/token/libs/TokenRouter.sol` — fee paths
+- `solidity/contracts/token/libs/TokenRouter.sol` — `_feeRecipientAndAmount()`, `_quoteGasPayment()`
+- `solidity/contracts/client/Router.sol` — `_Router_quoteDispatch()` → `mailbox.quoteDispatch()`
 - `solidity/contracts/token/fees/BaseFee.sol` — ITokenFee interface
 - `solidity/contracts/hooks/libs/AbstractPostDispatchHook.sol` — hook base
+- `solidity/contracts/interfaces/ITokenBridge.sol` — `Quote` struct, `ITokenFee` interface
 
 ## Verification
 
-1. Unit: AbstractOffchainQuoter — sig verify, quoteId replay, expiry, sender check, reentrancy
-2. Integration: OffchainQuotedFee returns pending fee via quoteTransferRemote
-3. Integration: OffchainQuotedHook returns pending fee via \_quoteDispatch, clears in \_postDispatch
-4. E2E: wrapper submits both quotes, warpRoute reads both fees, dispatch succeeds
-5. Security: bypass (direct warpRoute call) → \_postDispatch reverts, wrong signer → reverts
-
-## Unresolved Questions
-
-None.
+1. **Unit**: `AbstractOffchainQuoter` — sig verify, quoteId replay, expiry, sender check, reentrancy guard
+2. **Integration**: `OffchainQuotedFee` returns pending quotes via `quoteTransferRemote()`
+3. **Integration**: `OffchainQuotedHook` returns pending amount via `_quoteDispatch()`, clears in `_postDispatch()`
+4. **E2E**: Wrapper submits both quotes, warp route reads both fees, dispatch succeeds
+5. **Security**: bypass (direct `transferRemote()`) → `_postDispatch` reverts; wrong signer → reverts; replayed quoteId → reverts
