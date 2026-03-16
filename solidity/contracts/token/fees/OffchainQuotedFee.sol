@@ -46,6 +46,7 @@ contract OffchainQuotedFee is
 
     address public immutable quoteSigner;
     address public immutable feeToken;
+    address public immutable beneficiary;
 
     // ============ Structs ============
 
@@ -81,10 +82,12 @@ contract OffchainQuotedFee is
     constructor(
         address _quoteSigner,
         address _feeToken,
+        address _beneficiary,
         string[] memory __urls
     ) {
         quoteSigner = _quoteSigner;
         feeToken = _feeToken;
+        beneficiary = _beneficiary;
         _urls = __urls;
     }
 
@@ -125,7 +128,7 @@ contract OffchainQuotedFee is
 
     // ============ Fee Collection ============
 
-    function claim(address beneficiary) external {
+    function claim() external {
         if (feeToken == address(0)) {
             payable(beneficiary).sendValue(address(this).balance);
         } else {

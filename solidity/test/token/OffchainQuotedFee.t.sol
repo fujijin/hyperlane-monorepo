@@ -25,7 +25,7 @@ contract OffchainQuotedFeeTest is Test {
     function setUp() public {
         signer = vm.addr(signerPk);
         urls.push("https://quoter.example.com/{data}");
-        quotedFee = new OffchainQuotedFee(signer, FEE_TOKEN, urls);
+        quotedFee = new OffchainQuotedFee(signer, FEE_TOKEN, signer, urls);
     }
 
     // ============ Helpers ============
