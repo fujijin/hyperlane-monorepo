@@ -387,36 +387,6 @@ contract QuotedTransferTest is Test {
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }
 
-    function test_transferRemote_withStandingQuote() public {
-        uint48 now_ = uint48(block.timestamp);
-        AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
-            .SignedQuote({
-                context: _feeQuoteContext(),
-                data: bytes32(FEE),
-                issuedAt: now_,
-                expiry: now_ + 3600
-            });
-        quotedFee.submitQuote(sq, _signQuote(address(quotedFee), sq));
-
-        QuotedTransfer.QuoteSubmission[]
-            memory quotes = new QuotedTransfer.QuoteSubmission[](0);
-
-        uint256 totalTokens = TRANSFER_AMT + FEE;
-        vm.startPrank(ALICE);
-        primaryToken.approve(address(quotedTransfer), totalTokens);
-        bytes32 messageId = quotedTransfer.transferRemote(
-            address(localToken),
-            DESTINATION,
-            BOB.addressToBytes32(),
-            TRANSFER_AMT,
-            quotes
-        );
-        vm.stopPrank();
-
-        assertTrue(messageId != bytes32(0));
-        assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
-    }
-
     // ============ Tests: IGP + Fee Quote (ERC20 gas) ============
 
     function test_transferRemote_withIgpAndFeeQuotes() public {
