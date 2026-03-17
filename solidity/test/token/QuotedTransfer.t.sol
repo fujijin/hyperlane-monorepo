@@ -291,18 +291,9 @@ contract QuotedTransferTest is Test {
         bool transient_
     ) internal view returns (QuotedTransfer.QuoteSubmission memory) {
         uint48 now_ = uint48(block.timestamp);
-        // Standing context encodes (dest, sender) after selector;
-        // transient context encodes (feeToken, dest, sender)
-        bytes memory context = transient_
-            ? _igpQuoteContext()
-            : abi.encodeWithSelector(
-                IGP_QUOTE_CONTEXT_SELECTOR,
-                DESTINATION,
-                address(localToken)
-            );
         AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
             .SignedQuote({
-                context: context,
+                context: _igpQuoteContext(),
                 data: _packGasData(TOKEN_EXCHANGE_RATE, GAS_PRICE),
                 issuedAt: now_,
                 expiry: transient_ ? now_ : now_ + 3600

@@ -122,6 +122,7 @@ contract IGPOffchainQuotingTest is Test {
     }
 
     function _submitStanding(
+        address feeToken,
         uint32 dest,
         address sender_,
         uint128 rate,
@@ -133,6 +134,7 @@ contract IGPOffchainQuotingTest is Test {
             .SignedQuote({
                 context: abi.encodeWithSelector(
                     QUOTE_CONTEXT_SELECTOR,
+                    feeToken,
                     dest,
                     sender_
                 ),
@@ -312,6 +314,7 @@ contract IGPOffchainQuotingTest is Test {
     function test_standingQuote_specificMatch() public {
         uint48 now_ = uint48(block.timestamp);
         _submitStanding(
+            address(0),
             DEST,
             address(this),
             EXCHANGE_RATE,
@@ -328,6 +331,7 @@ contract IGPOffchainQuotingTest is Test {
         uint48 now_ = uint48(block.timestamp);
         address wildcard = address(type(uint160).max);
         _submitStanding(
+            address(0),
             DEST,
             wildcard,
             EXCHANGE_RATE,
@@ -344,6 +348,7 @@ contract IGPOffchainQuotingTest is Test {
         uint48 now_ = uint48(block.timestamp);
         uint32 wildcardDest = type(uint32).max;
         _submitStanding(
+            address(0),
             wildcardDest,
             address(this),
             EXCHANGE_RATE,
@@ -359,6 +364,7 @@ contract IGPOffchainQuotingTest is Test {
     function test_standingQuote_expired_fallsToOracle() public {
         uint48 now_ = uint48(block.timestamp);
         _submitStanding(
+            address(0),
             DEST,
             address(this),
             EXCHANGE_RATE,
@@ -376,6 +382,7 @@ contract IGPOffchainQuotingTest is Test {
     function test_standingQuote_staleRejected() public {
         uint48 now_ = uint48(block.timestamp);
         _submitStanding(
+            address(0),
             DEST,
             address(this),
             EXCHANGE_RATE,
@@ -389,6 +396,7 @@ contract IGPOffchainQuotingTest is Test {
             .SignedQuote({
                 context: abi.encodeWithSelector(
                     QUOTE_CONTEXT_SELECTOR,
+                    address(0),
                     DEST,
                     address(this)
                 ),
@@ -409,6 +417,7 @@ contract IGPOffchainQuotingTest is Test {
         uint128 transientRate = 5e10;
 
         _submitStanding(
+            address(0),
             DEST,
             address(this),
             standingRate,
@@ -436,6 +445,7 @@ contract IGPOffchainQuotingTest is Test {
 
         address wildcard = address(type(uint160).max);
         _submitStanding(
+            address(0),
             DEST,
             wildcard,
             wildcardRate,
@@ -444,6 +454,7 @@ contract IGPOffchainQuotingTest is Test {
             now_ + 3600
         );
         _submitStanding(
+            address(0),
             DEST,
             address(this),
             specificRate,
@@ -467,6 +478,7 @@ contract IGPOffchainQuotingTest is Test {
             .SignedQuote({
                 context: abi.encodeWithSelector(
                     QUOTE_CONTEXT_SELECTOR,
+                    address(0),
                     DEST,
                     address(this)
                 ),
@@ -512,6 +524,7 @@ contract IGPOffchainQuotingTest is Test {
 
         uint48 now_ = uint48(block.timestamp);
         _submitStanding(
+            address(0),
             DEST,
             address(this),
             uint128(rate),
@@ -525,6 +538,114 @@ contract IGPOffchainQuotingTest is Test {
             uint256(gasPrice) *
             uint256(rate)) / 1e10;
         assertEq(fee, expected);
+    }
+
+    // ============ ERC20 Fee Token Quotes ============
+
+    address constant FEE_TOKEN = address(0xFEE);
+    uint128 constant TOKEN_RATE = 5e10; // 5.0 — different from native
+
+    function _setupTokenOracle() internal {
+        InterchainGasPaymaster.TokenGasOracleConfig[]
+            memory configs = new InterchainGasPaymaster.TokenGasOracleConfig[](
+                1
+            );
+        configs[0] = InterchainGasPaymaster.TokenGasOracleConfig({
+            feeToken: FEE_TOKEN,
+            remoteDomain: DEST,
+            gasOracle: oracle
+        });
+        igp.setTokenGasOracles(configs);
+    }
+
+    function test_erc20_transientQuote() public {
+        _setupTokenOracle();
+
+        _submitTransient(FEE_TOKEN, DEST, address(this), TOKEN_RATE, GAS_PRICE);
+
+        // TOKEN_RATE=5e10, GAS_PRICE=150 → 300000 * 150 * 5e10 / 1e10 = 225000000
+        uint256 fee = igp.quoteGasPayment(FEE_TOKEN, DEST, GAS_LIMIT);
+        assertEq(fee, 225_000_000);
+    }
+
+    function test_erc20_standingQuote_specificMatch() public {
+        _setupTokenOracle();
+        uint48 now_ = uint48(block.timestamp);
+
+        _submitStanding(
+            FEE_TOKEN,
+            DEST,
+            address(this),
+            TOKEN_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(FEE_TOKEN, DEST, GAS_LIMIT);
+        assertEq(fee, 225_000_000);
+    }
+
+    function test_erc20_standingQuote_wildcardSender() public {
+        _setupTokenOracle();
+        uint48 now_ = uint48(block.timestamp);
+        address wildcard = address(type(uint160).max);
+
+        _submitStanding(
+            FEE_TOKEN,
+            DEST,
+            wildcard,
+            TOKEN_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(FEE_TOKEN, DEST, GAS_LIMIT);
+        assertEq(fee, 225_000_000);
+    }
+
+    function test_erc20_standingQuote_wildcardDest() public {
+        _setupTokenOracle();
+        uint48 now_ = uint48(block.timestamp);
+        uint32 wildcardDest = type(uint32).max;
+
+        _submitStanding(
+            FEE_TOKEN,
+            wildcardDest,
+            address(this),
+            TOKEN_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(FEE_TOKEN, DEST, GAS_LIMIT);
+        assertEq(fee, 225_000_000);
+    }
+
+    function test_erc20_standingQuote_isolatedFromNative() public {
+        _setupTokenOracle();
+        uint48 now_ = uint48(block.timestamp);
+
+        // Standing quote for FEE_TOKEN only
+        _submitStanding(
+            FEE_TOKEN,
+            DEST,
+            address(this),
+            TOKEN_RATE,
+            GAS_PRICE,
+            now_,
+            now_ + 3600
+        );
+
+        // FEE_TOKEN resolves offchain quote
+        uint256 tokenFee = igp.quoteGasPayment(FEE_TOKEN, DEST, GAS_LIMIT);
+        assertEq(tokenFee, 225_000_000);
+
+        // Native falls through to oracle (no native standing quote)
+        uint256 nativeFee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(nativeFee, 30_000_000); // oracle rate
     }
 
     receive() external payable {}

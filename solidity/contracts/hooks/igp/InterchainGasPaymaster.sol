@@ -99,8 +99,9 @@ contract InterchainGasPaymaster is
     /// @notice Offchain quote signer
     address public offchainQuoteSigner;
 
-    /// @notice Standing offchain quotes: offchainQuotes[destination][sender]
-    mapping(uint32 => mapping(address => StoredGasQuote)) public offchainQuotes;
+    /// @notice Standing offchain quotes: offchainQuotes[feeToken][destination][sender]
+    mapping(address => mapping(uint32 => mapping(address => StoredGasQuote)))
+        public offchainQuotes;
 
     /// @dev Transient quote — tx-scoped, auto-clears. 0 exchangeRate = no quote.
     uint128 private transient _transientExchangeRate;
@@ -349,19 +350,19 @@ contract InterchainGasPaymaster is
 
         // 2-4. Standing offchain quotes
         uint256 fee = _resolveGasQuote(
-            offchainQuotes[_destinationDomain][msg.sender],
+            offchainQuotes[_feeToken][_destinationDomain][msg.sender],
             _gasLimit
         );
         if (fee != 0) return fee;
 
         fee = _resolveGasQuote(
-            offchainQuotes[_destinationDomain][WILDCARD_SENDER],
+            offchainQuotes[_feeToken][_destinationDomain][WILDCARD_SENDER],
             _gasLimit
         );
         if (fee != 0) return fee;
 
         fee = _resolveGasQuote(
-            offchainQuotes[WILDCARD_DEST][msg.sender],
+            offchainQuotes[_feeToken][WILDCARD_DEST][msg.sender],
             _gasLimit
         );
         if (fee != 0) return fee;
@@ -647,14 +648,16 @@ contract InterchainGasPaymaster is
     }
 
     function _storeStanding(SignedQuote calldata sq) internal override {
-        (uint32 dest, address sender) = abi.decode(
+        (address feeToken_, uint32 dest, address sender) = abi.decode(
             sq.context[4:],
-            (uint32, address)
+            (address, uint32, address)
         );
-        StoredGasQuote storage existing = offchainQuotes[dest][sender];
+        StoredGasQuote storage existing = offchainQuotes[feeToken_][dest][
+            sender
+        ];
         if (sq.issuedAt <= existing.issuedAt) revert StaleQuote();
         (uint128 rate, uint128 gasPrice) = _unpackGasData(sq.data);
-        offchainQuotes[dest][sender] = StoredGasQuote(
+        offchainQuotes[feeToken_][dest][sender] = StoredGasQuote(
             rate,
             gasPrice,
             sq.issuedAt,
