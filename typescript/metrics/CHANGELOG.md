@@ -1,5 +1,16 @@
 # @hyperlane-xyz/metrics
 
+## 0.2.4
+
+### Patch Changes
+
+- Updated dependencies [6c715a7]
+- Updated dependencies [6c715a7]
+- Updated dependencies [2e622e8]
+  - @hyperlane-xyz/core@11.1.0
+  - @hyperlane-xyz/sdk@28.1.0
+  - @hyperlane-xyz/utils@28.1.0
+
 ## 0.2.3
 
 ### Patch Changes
