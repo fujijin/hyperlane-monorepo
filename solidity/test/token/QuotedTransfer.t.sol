@@ -35,8 +35,12 @@ contract QuotedTransferTest is Test {
     uint256 constant HALF_AMOUNT = 0.5 ether; // fee = maxFee at amount = 2 * halfAmount
     uint256 constant GAS_LIMIT = 50_000;
     uint96 constant GAS_OVERHEAD = 10_000;
-    uint128 constant TOKEN_EXCHANGE_RATE = 1e10;
-    uint128 constant GAS_PRICE = 10;
+    // Oracle rates (fallback)
+    uint128 constant ORACLE_EXCHANGE_RATE = 1e10;
+    uint128 constant ORACLE_GAS_PRICE = 10;
+    // Offchain quote rates (distinct from oracle to verify correct path)
+    uint128 constant OFFCHAIN_EXCHANGE_RATE = 2e10;
+    uint128 constant OFFCHAIN_GAS_PRICE = 20;
     address constant ALICE = address(0x1);
     address constant BOB = address(0x2);
     address constant PROXY_ADMIN = address(0x37);
@@ -88,8 +92,8 @@ contract QuotedTransferTest is Test {
             memory configs = new StorageGasOracle.RemoteGasDataConfig[](1);
         configs[0] = StorageGasOracle.RemoteGasDataConfig({
             remoteDomain: DESTINATION,
-            tokenExchangeRate: TOKEN_EXCHANGE_RATE,
-            gasPrice: GAS_PRICE
+            tokenExchangeRate: ORACLE_EXCHANGE_RATE,
+            gasPrice: ORACLE_GAS_PRICE
         });
         gasOracle.setRemoteGasDataConfigs(configs);
 
@@ -266,14 +270,14 @@ contract QuotedTransferTest is Test {
     }
 
     /// @dev IGP context: quoteGasPayment(feeToken, destination, sender)
-    ///      where sender = warp route (it calls hook.quoteDispatch)
+    ///      where sender = hyperlane message sender (warp route)
     function _igpQuoteContext() internal view returns (bytes memory) {
         return
             abi.encodeWithSelector(
                 IGP_QUOTE_CONTEXT_SELECTOR,
                 address(primaryToken), // feeToken = token() when feeHook is set
                 DESTINATION,
-                address(localToken) // msg.sender in quoteGasPayment = warp route
+                address(localToken) // message.senderAddress() = warp route
             );
     }
 
@@ -299,7 +303,10 @@ contract QuotedTransferTest is Test {
         AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
             .SignedQuote({
                 context: _igpQuoteContext(),
-                data: _encodeGasData(TOKEN_EXCHANGE_RATE, GAS_PRICE),
+                data: _encodeGasData(
+                    OFFCHAIN_EXCHANGE_RATE,
+                    OFFCHAIN_GAS_PRICE
+                ),
                 issuedAt: now_,
                 expiry: transient_ ? now_ : now_ + 3600,
                 salt: bytes32(0),
@@ -313,10 +320,20 @@ contract QuotedTransferTest is Test {
             });
     }
 
-    function _computeIgpFee() internal view returns (uint256) {
+    function _computeOracleIgpFee() internal view returns (uint256) {
         uint256 totalGas = igp.destinationGasLimit(DESTINATION, GAS_LIMIT);
         return
-            igp.quoteGasPayment(address(primaryToken), DESTINATION, totalGas);
+            (totalGas *
+                uint256(ORACLE_GAS_PRICE) *
+                uint256(ORACLE_EXCHANGE_RATE)) / 1e10;
+    }
+
+    function _computeOffchainIgpFee() internal view returns (uint256) {
+        uint256 totalGas = igp.destinationGasLimit(DESTINATION, GAS_LIMIT);
+        return
+            (totalGas *
+                uint256(OFFCHAIN_GAS_PRICE) *
+                uint256(OFFCHAIN_EXCHANGE_RATE)) / 1e10;
     }
 
     // ============ Tests: Fee Quote Only (native gas) ============
@@ -396,7 +413,7 @@ contract QuotedTransferTest is Test {
         localToken.setHook(address(igp));
 
         // Compute expected IGP fee from oracle (before submitting offchain quote)
-        uint256 igpFee = _computeIgpFee();
+        uint256 igpFee = _computeOffchainIgpFee();
         assertGt(igpFee, 0, "IGP fee should be > 0");
 
         // Build both quotes
@@ -439,7 +456,7 @@ contract QuotedTransferTest is Test {
         localToken.setFeeHook(address(igp));
         localToken.setHook(address(igp));
 
-        uint256 igpFee = _computeIgpFee();
+        uint256 igpFee = _computeOffchainIgpFee();
 
         QuotedTransfer.QuoteSubmission[]
             memory quotes = new QuotedTransfer.QuoteSubmission[](1);
@@ -517,7 +534,7 @@ contract QuotedTransferTest is Test {
         localToken.setFeeHook(address(igp));
         localToken.setHook(address(igp));
 
-        uint256 igpFee = _computeIgpFee();
+        uint256 igpFee = _computeOffchainIgpFee();
 
         QuotedTransfer.QuoteSubmission[]
             memory quotes = new QuotedTransfer.QuoteSubmission[](2);
@@ -571,7 +588,7 @@ contract QuotedTransferTest is Test {
         localToken.setFeeHook(address(igp));
         localToken.setHook(address(igp));
 
-        uint256 igpFee = _computeIgpFee();
+        uint256 igpFee = _computeOffchainIgpFee();
 
         QuotedTransfer.QuoteSubmission[]
             memory quotes = new QuotedTransfer.QuoteSubmission[](1);
@@ -600,7 +617,7 @@ contract QuotedTransferTest is Test {
         localToken.setFeeHook(address(igp));
         localToken.setHook(address(igp));
 
-        uint256 igpFee = _computeIgpFee();
+        uint256 igpFee = _computeOffchainIgpFee();
 
         QuotedTransfer.QuoteSubmission[]
             memory quotes = new QuotedTransfer.QuoteSubmission[](2);
@@ -643,7 +660,7 @@ contract QuotedTransferTest is Test {
             standingQuotes
         );
 
-        uint256 igpFee = _computeIgpFee();
+        uint256 igpFee = _computeOffchainIgpFee();
 
         // Transfer with only transient IGP quote — standing fee resolves
         QuotedTransfer.QuoteSubmission[]

@@ -521,6 +521,31 @@ contract IGPOffchainQuotingTest is Test {
         igp.addQuoteSigner(address(0x123));
     }
 
+    // ============ Zero Fee ============
+
+    function test_transientQuote_zeroFee() public {
+        _submitTransient(address(0), DEST, address(this), 0, 0);
+
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 0);
+    }
+
+    function test_standingQuote_zeroFee() public {
+        uint48 now_ = uint48(block.timestamp);
+        _submitStanding(
+            address(0),
+            DEST,
+            address(this),
+            0,
+            0,
+            now_,
+            now_ + 3600
+        );
+
+        uint256 fee = igp.quoteGasPayment(DEST, GAS_LIMIT);
+        assertEq(fee, 0);
+    }
+
     // ============ Fee math ============
 
     function test_computeGasFee(

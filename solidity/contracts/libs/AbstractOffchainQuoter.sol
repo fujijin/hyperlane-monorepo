@@ -83,12 +83,10 @@ abstract contract AbstractOffchainQuoter {
     // ============ Events ============
 
     event QuoteSubmitted(
-        bytes context,
-        bytes data,
-        uint48 issuedAt,
-        uint48 expiry,
+        address indexed submitter,
         bytes32 salt,
-        address submitter
+        uint48 issuedAt,
+        uint48 expiry
     );
 
     event QuoteSignerAdded(address signer);
@@ -105,21 +103,13 @@ abstract contract AbstractOffchainQuoter {
             revert InvalidSubmitter();
         _verifyQuoteSigner(sq, signature);
 
-        bool isTransient = sq.expiry == sq.issuedAt;
-        if (isTransient) {
+        if (sq.expiry == sq.issuedAt) {
             _storeTransient(sq);
         } else {
             _storeStanding(sq);
         }
 
-        emit QuoteSubmitted(
-            sq.context,
-            sq.data,
-            sq.issuedAt,
-            sq.expiry,
-            sq.salt,
-            sq.submitter
-        );
+        emit QuoteSubmitted(msg.sender, sq.salt, sq.issuedAt, sq.expiry);
     }
 
     // ============ Views ============
@@ -178,8 +168,7 @@ abstract contract AbstractOffchainQuoter {
         );
         bytes32 digest = ECDSA.toTypedDataHash(_domainSeparator(), structHash);
         address signer = ECDSA.recover(digest, signature);
-        if (!_getQuoterStorage().signers.contains(signer))
-            revert InvalidSigner();
+        if (!isQuoteSigner(signer)) revert InvalidSigner();
     }
 
     // ============ Abstract ============

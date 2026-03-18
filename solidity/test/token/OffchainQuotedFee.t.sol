@@ -201,6 +201,29 @@ contract OffchainQuotedFeeTest is Test {
         assertEq(result[0].amount, _computeFee(MAX_FEE, HALF_AMOUNT, 42 ether));
     }
 
+    function test_transientQuote_zeroFee() public {
+        _submitTransient(DEST, RECIPIENT, AMOUNT, 0, 0);
+
+        Quote[] memory result = quotedFee.quoteTransferRemote(
+            DEST,
+            RECIPIENT,
+            AMOUNT
+        );
+        assertEq(result[0].amount, 0);
+    }
+
+    function test_standingQuote_zeroFee() public {
+        uint48 now_ = uint48(block.timestamp);
+        _submitStanding(DEST, RECIPIENT, AMOUNT, 0, 0, now_, now_ + 3600);
+
+        Quote[] memory result = quotedFee.quoteTransferRemote(
+            DEST,
+            RECIPIENT,
+            AMOUNT
+        );
+        assertEq(result[0].amount, 0);
+    }
+
     // ============ Standing Quotes ============
 
     function test_standingQuote_specificMatch() public {

@@ -61,11 +61,13 @@ contract OffchainQuotedFee is
 
     // ============ Storage ============
 
-    mapping(uint32 => mapping(bytes32 => StoredQuote)) public quotes;
+    mapping(uint32 destination => mapping(bytes32 recipient => StoredQuote))
+        public quotes;
     string[] internal _urls;
 
     // ============ Transient Storage ============
 
+    bool private transient quotedTransient;
     uint256 private transient quotedMaxFee;
     uint256 private transient quotedHalfAmount;
     uint32 private transient quotedDestination;
@@ -106,9 +108,8 @@ contract OffchainQuotedFee is
         uint256 _amount
     ) external view override returns (Quote[] memory) {
         // 1. Transient — match individual context fields
-        uint256 fee;
         if (
-            quotedMaxFee != 0 &&
+            quotedTransient &&
             (quotedDestination == WILDCARD_DEST ||
                 quotedDestination == _destination) &&
             (quotedRecipient == WILDCARD_RECIPIENT ||
@@ -121,16 +122,25 @@ contract OffchainQuotedFee is
                 );
 
         // 2. Specific: destination + recipient
-        fee = _resolveStored(quotes[_destination][_recipient], _amount);
-        if (fee != 0) return _singleQuote(fee);
+        (bool found, uint256 resolved) = _resolveStored(
+            quotes[_destination][_recipient],
+            _amount
+        );
+        if (found) return _singleQuote(resolved);
 
         // 3. Destination-only
-        fee = _resolveStored(quotes[_destination][WILDCARD_RECIPIENT], _amount);
-        if (fee != 0) return _singleQuote(fee);
+        (found, resolved) = _resolveStored(
+            quotes[_destination][WILDCARD_RECIPIENT],
+            _amount
+        );
+        if (found) return _singleQuote(resolved);
 
         // 4. Recipient-only
-        fee = _resolveStored(quotes[WILDCARD_DEST][_recipient], _amount);
-        if (fee != 0) return _singleQuote(fee);
+        (found, resolved) = _resolveStored(
+            quotes[WILDCARD_DEST][_recipient],
+            _amount
+        );
+        if (found) return _singleQuote(resolved);
 
         // 5. CCIP-Read
         revert OffchainLookup(
@@ -173,6 +183,7 @@ contract OffchainQuotedFee is
     }
 
     function _storeTransient(SignedQuote calldata sq) internal override {
+        quotedTransient = true;
         (quotedMaxFee, quotedHalfAmount) = abi.decode(
             sq.data,
             (uint256, uint256)
@@ -186,11 +197,11 @@ contract OffchainQuotedFee is
     function _resolveStored(
         StoredQuote storage sq,
         uint256 amount
-    ) internal view returns (uint256) {
+    ) internal view returns (bool, uint256) {
         if (sq.expiry > 0 && uint48(block.timestamp) <= sq.expiry) {
-            return _computeFee(sq.maxFee, sq.halfAmount, amount);
+            return (true, _computeFee(sq.maxFee, sq.halfAmount, amount));
         }
-        return 0;
+        return (false, 0);
     }
 
     /// @dev Same formula as LinearFee: min(maxFee, amount * maxFee / (2 * halfAmount))
@@ -199,6 +210,7 @@ contract OffchainQuotedFee is
         uint256 halfAmount_,
         uint256 amount
     ) internal pure returns (uint256) {
+        if (maxFee_ == 0) return 0;
         uint256 uncapped = (amount * maxFee_) / (2 * halfAmount_);
         return uncapped > maxFee_ ? maxFee_ : uncapped;
     }
