@@ -85,10 +85,6 @@ contract InterchainGasPaymaster is
     uint32 constant WILDCARD_DEST = type(uint32).max;
     address constant WILDCARD_SENDER = address(type(uint160).max);
 
-    /// @dev Selector used as context prefix for transient quote hashing.
-    bytes4 constant QUOTE_CONTEXT_SELECTOR =
-        bytes4(keccak256("quoteGasPayment(address,uint32,uint256)"));
-
     struct StoredGasQuote {
         uint128 tokenExchangeRate; // slot 1
         uint128 gasPrice; // slot 1
@@ -96,17 +92,16 @@ contract InterchainGasPaymaster is
         uint48 expiry; // slot 2
     }
 
-    /// @notice Offchain quote signer
-    address public offchainQuoteSigner;
-
     /// @notice Standing offchain quotes: offchainQuotes[feeToken][destination][sender]
     mapping(address => mapping(uint32 => mapping(address => StoredGasQuote)))
         public offchainQuotes;
 
     /// @dev Transient quote — tx-scoped, auto-clears. 0 exchangeRate = no quote.
-    uint128 private transient _transientExchangeRate;
-    uint128 private transient _transientGasPrice;
-    bytes32 private transient _transientContextHash;
+    uint128 private transient quotedExchangeRate;
+    uint128 private transient quotedGasPrice;
+    address private transient quotedFeeToken;
+    uint32 private transient quotedDestination;
+    address private transient quotedSender;
 
     // ============ Events ============
 
@@ -328,25 +323,14 @@ contract InterchainGasPaymaster is
         uint32 _destinationDomain,
         uint256 _gasLimit
     ) public view virtual returns (uint256) {
-        // 1. Transient offchain quote — verify context hash matches
+        // 1. Transient offchain quote — match individual context fields
         if (
-            _transientExchangeRate != 0 &&
-            _transientContextHash ==
-            keccak256(
-                abi.encodeWithSelector(
-                    QUOTE_CONTEXT_SELECTOR,
-                    _feeToken,
-                    _destinationDomain,
-                    msg.sender
-                )
-            )
-        )
-            return
-                _computeGasFee(
-                    _transientExchangeRate,
-                    _transientGasPrice,
-                    _gasLimit
-                );
+            quotedExchangeRate != 0 &&
+            quotedFeeToken == _feeToken &&
+            (quotedDestination == WILDCARD_DEST ||
+                quotedDestination == _destinationDomain) &&
+            (quotedSender == WILDCARD_SENDER || quotedSender == msg.sender)
+        ) return _computeGasFee(quotedExchangeRate, quotedGasPrice, _gasLimit);
 
         // 2-4. Standing offchain quotes
         uint256 fee = _resolveGasQuote(
@@ -559,9 +543,11 @@ contract InterchainGasPaymaster is
         );
 
         // Clear transient quote after use to prevent reuse within same tx
-        _transientExchangeRate = 0;
-        _transientGasPrice = 0;
-        _transientContextHash = bytes32(0);
+        quotedExchangeRate = 0;
+        quotedGasPrice = 0;
+        quotedFeeToken = address(0);
+        quotedDestination = 0;
+        quotedSender = address(0);
 
         address _payerOrRefundAddress = _feeToken == address(0)
             ? metadata.refundAddress(message.senderAddress())
@@ -636,15 +622,15 @@ contract InterchainGasPaymaster is
 
     // ============ Offchain Quoting: AbstractOffchainQuoter implementation ============
 
-    function _quoteSigner() internal view override returns (address) {
-        return offchainQuoteSigner;
-    }
-
     function _storeTransient(SignedQuote calldata sq) internal override {
-        (uint128 rate, uint128 gasPrice) = _unpackGasData(sq.data);
-        _transientExchangeRate = rate;
-        _transientGasPrice = gasPrice;
-        _transientContextHash = keccak256(sq.context);
+        (quotedExchangeRate, quotedGasPrice) = abi.decode(
+            sq.data,
+            (uint128, uint128)
+        );
+        (quotedFeeToken, quotedDestination, quotedSender) = abi.decode(
+            sq.context[4:],
+            (address, uint32, address)
+        );
     }
 
     function _storeStanding(SignedQuote calldata sq) internal override {
@@ -656,7 +642,10 @@ contract InterchainGasPaymaster is
             sender
         ];
         if (sq.issuedAt <= existing.issuedAt) revert StaleQuote();
-        (uint128 rate, uint128 gasPrice) = _unpackGasData(sq.data);
+        (uint128 rate, uint128 gasPrice) = abi.decode(
+            sq.data,
+            (uint128, uint128)
+        );
         offchainQuotes[feeToken_][dest][sender] = StoredGasQuote(
             rate,
             gasPrice,
@@ -665,16 +654,14 @@ contract InterchainGasPaymaster is
         );
     }
 
-    function _unpackGasData(
-        bytes32 data
-    ) internal pure returns (uint128 rate, uint128 gasPrice) {
-        rate = uint128(uint256(data) >> 128);
-        gasPrice = uint128(uint256(data));
+    /// @notice Add an offchain quote signer. Only callable by owner.
+    function addQuoteSigner(address _signer) external onlyOwner {
+        _addQuoteSigner(_signer);
     }
 
-    /// @notice Set the offchain quote signer. Only callable by owner.
-    function setOffchainQuoteSigner(address _signer) external onlyOwner {
-        offchainQuoteSigner = _signer;
+    /// @notice Remove an offchain quote signer. Only callable by owner.
+    function removeQuoteSigner(address _signer) external onlyOwner {
+        _removeQuoteSigner(_signer);
     }
 
     /**

@@ -31,7 +31,8 @@ contract QuotedTransferTest is Test {
     uint8 constant DECIMALS = 18;
     uint256 constant TOTAL_SUPPLY = 1_000_000e18;
     uint256 constant TRANSFER_AMT = 100e18;
-    uint256 constant FEE = 0.01 ether;
+    uint256 constant MAX_FEE = 0.01 ether;
+    uint256 constant HALF_AMOUNT = 0.5 ether; // fee = maxFee at amount = 2 * halfAmount
     uint256 constant GAS_LIMIT = 50_000;
     uint96 constant GAS_OVERHEAD = 10_000;
     uint128 constant TOKEN_EXCHANGE_RATE = 1e10;
@@ -80,7 +81,7 @@ contract QuotedTransferTest is Test {
         // IGP with offchain quoting
         igp = new InterchainGasPaymaster();
         igp.initialize(address(this), address(this));
-        igp.setOffchainQuoteSigner(signer);
+        igp.addQuoteSigner(signer);
 
         gasOracle = new StorageGasOracle();
         StorageGasOracle.RemoteGasDataConfig[]
@@ -210,9 +211,11 @@ contract QuotedTransferTest is Test {
             abi.encode(
                 quotedFee.SIGNED_QUOTE_TYPEHASH(),
                 keccak256(sq.context),
-                sq.data,
+                keccak256(sq.data),
                 sq.issuedAt,
-                sq.expiry
+                sq.expiry,
+                sq.salt,
+                sq.submitter
             )
         );
         bytes32 digest = ECDSA.toTypedDataHash(
@@ -248,9 +251,11 @@ contract QuotedTransferTest is Test {
         AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
             .SignedQuote({
                 context: _feeQuoteContext(),
-                data: bytes32(FEE),
+                data: abi.encode(MAX_FEE, HALF_AMOUNT),
                 issuedAt: now_,
-                expiry: transient_ ? now_ : now_ + 3600
+                expiry: transient_ ? now_ : now_ + 3600,
+                salt: bytes32(0),
+                submitter: address(0)
             });
         return
             QuotedTransfer.QuoteSubmission({
@@ -272,11 +277,11 @@ contract QuotedTransferTest is Test {
             );
     }
 
-    function _packGasData(
+    function _encodeGasData(
         uint128 exchangeRate,
         uint128 gasPrice
-    ) internal pure returns (bytes32) {
-        return bytes32((uint256(exchangeRate) << 128) | uint256(gasPrice));
+    ) internal pure returns (bytes memory) {
+        return abi.encode(exchangeRate, gasPrice);
     }
 
     function _buildIgpQuote()
@@ -294,9 +299,11 @@ contract QuotedTransferTest is Test {
         AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
             .SignedQuote({
                 context: _igpQuoteContext(),
-                data: _packGasData(TOKEN_EXCHANGE_RATE, GAS_PRICE),
+                data: _encodeGasData(TOKEN_EXCHANGE_RATE, GAS_PRICE),
                 issuedAt: now_,
-                expiry: transient_ ? now_ : now_ + 3600
+                expiry: transient_ ? now_ : now_ + 3600,
+                salt: bytes32(0),
+                submitter: address(0)
             });
         return
             QuotedTransfer.QuoteSubmission({
@@ -319,7 +326,7 @@ contract QuotedTransferTest is Test {
             memory quotes = new QuotedTransfer.QuoteSubmission[](1);
         quotes[0] = _buildFeeQuote();
 
-        uint256 totalTokens = TRANSFER_AMT + FEE;
+        uint256 totalTokens = TRANSFER_AMT + MAX_FEE;
 
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalTokens);
@@ -334,7 +341,7 @@ contract QuotedTransferTest is Test {
 
         assertTrue(messageId != bytes32(0));
         assertEq(primaryToken.balanceOf(ALICE), 1000e18 - totalTokens);
-        assertEq(primaryToken.balanceOf(address(quotedFee)), FEE);
+        assertEq(primaryToken.balanceOf(address(quotedFee)), MAX_FEE);
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }
 
@@ -361,7 +368,7 @@ contract QuotedTransferTest is Test {
         quotes[0] = _buildFeeQuote();
 
         uint256 excess = 10e18;
-        uint256 totalApproval = TRANSFER_AMT + FEE + excess;
+        uint256 totalApproval = TRANSFER_AMT + MAX_FEE + excess;
 
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalApproval);
@@ -374,7 +381,10 @@ contract QuotedTransferTest is Test {
         );
         vm.stopPrank();
 
-        assertEq(primaryToken.balanceOf(ALICE), 1000e18 - TRANSFER_AMT - FEE);
+        assertEq(
+            primaryToken.balanceOf(ALICE),
+            1000e18 - TRANSFER_AMT - MAX_FEE
+        );
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }
 
@@ -395,7 +405,7 @@ contract QuotedTransferTest is Test {
         quotes[0] = _buildIgpQuote();
         quotes[1] = _buildFeeQuote();
 
-        uint256 totalTokens = TRANSFER_AMT + FEE + igpFee;
+        uint256 totalTokens = TRANSFER_AMT + MAX_FEE + igpFee;
 
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalTokens);
@@ -414,7 +424,7 @@ contract QuotedTransferTest is Test {
         assertEq(primaryToken.balanceOf(ALICE), 1000e18 - totalTokens);
 
         // Fee went to quotedFee contract
-        assertEq(primaryToken.balanceOf(address(quotedFee)), FEE);
+        assertEq(primaryToken.balanceOf(address(quotedFee)), MAX_FEE);
 
         // IGP received gas fee
         assertEq(primaryToken.balanceOf(address(igp)), igpFee);
@@ -460,7 +470,7 @@ contract QuotedTransferTest is Test {
             memory quotes = new QuotedTransfer.QuoteSubmission[](1);
         quotes[0] = _buildFeeQuote();
 
-        uint256 totalTokens = TRANSFER_AMT + FEE;
+        uint256 totalTokens = TRANSFER_AMT + MAX_FEE;
 
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalTokens);
@@ -475,7 +485,7 @@ contract QuotedTransferTest is Test {
 
         assertTrue(messageId != bytes32(0));
         assertEq(primaryToken.balanceOf(ALICE), 1000e18 - totalTokens);
-        assertEq(primaryToken.balanceOf(address(quotedFee)), FEE);
+        assertEq(primaryToken.balanceOf(address(quotedFee)), MAX_FEE);
         assertEq(primaryToken.balanceOf(address(igp)), 0);
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }
@@ -500,7 +510,7 @@ contract QuotedTransferTest is Test {
         assertEq(result[0].amount, 0);
         // [1] = bridge amount + protocol fee
         assertEq(result[1].token, address(primaryToken));
-        assertEq(result[1].amount, TRANSFER_AMT + FEE);
+        assertEq(result[1].amount, TRANSFER_AMT + MAX_FEE);
     }
 
     function test_quoteTransferRemote_withIgpAndFeeQuotes() public {
@@ -527,7 +537,7 @@ contract QuotedTransferTest is Test {
         assertEq(result[0].amount, igpFee);
         // [1] = bridge amount + protocol fee
         assertEq(result[1].token, address(primaryToken));
-        assertEq(result[1].amount, TRANSFER_AMT + FEE);
+        assertEq(result[1].amount, TRANSFER_AMT + MAX_FEE);
     }
 
     // ============ Tests: Standing Quotes ============
@@ -537,7 +547,7 @@ contract QuotedTransferTest is Test {
             memory quotes = new QuotedTransfer.QuoteSubmission[](1);
         quotes[0] = _buildFeeQuote(false);
 
-        uint256 totalTokens = TRANSFER_AMT + FEE;
+        uint256 totalTokens = TRANSFER_AMT + MAX_FEE;
 
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalTokens);
@@ -552,7 +562,7 @@ contract QuotedTransferTest is Test {
 
         assertTrue(messageId != bytes32(0));
         assertEq(primaryToken.balanceOf(ALICE), 1000e18 - totalTokens);
-        assertEq(primaryToken.balanceOf(address(quotedFee)), FEE);
+        assertEq(primaryToken.balanceOf(address(quotedFee)), MAX_FEE);
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }
 
@@ -597,7 +607,7 @@ contract QuotedTransferTest is Test {
         quotes[0] = _buildIgpQuote(false);
         quotes[1] = _buildFeeQuote(false);
 
-        uint256 totalTokens = TRANSFER_AMT + FEE + igpFee;
+        uint256 totalTokens = TRANSFER_AMT + MAX_FEE + igpFee;
 
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalTokens);
@@ -612,7 +622,7 @@ contract QuotedTransferTest is Test {
 
         assertTrue(messageId != bytes32(0));
         assertEq(primaryToken.balanceOf(ALICE), 1000e18 - totalTokens);
-        assertEq(primaryToken.balanceOf(address(quotedFee)), FEE);
+        assertEq(primaryToken.balanceOf(address(quotedFee)), MAX_FEE);
         assertEq(primaryToken.balanceOf(address(igp)), igpFee);
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }
@@ -640,7 +650,7 @@ contract QuotedTransferTest is Test {
             memory quotes = new QuotedTransfer.QuoteSubmission[](1);
         quotes[0] = _buildIgpQuote(true);
 
-        uint256 totalTokens = TRANSFER_AMT + FEE + igpFee;
+        uint256 totalTokens = TRANSFER_AMT + MAX_FEE + igpFee;
         vm.startPrank(ALICE);
         primaryToken.approve(address(quotedTransfer), totalTokens);
         bytes32 messageId = quotedTransfer.transferRemote(
@@ -654,7 +664,7 @@ contract QuotedTransferTest is Test {
 
         assertTrue(messageId != bytes32(0));
         assertEq(primaryToken.balanceOf(ALICE), 1000e18 - totalTokens);
-        assertEq(primaryToken.balanceOf(address(quotedFee)), FEE);
+        assertEq(primaryToken.balanceOf(address(quotedFee)), MAX_FEE);
         assertEq(primaryToken.balanceOf(address(igp)), igpFee);
         assertEq(primaryToken.balanceOf(address(quotedTransfer)), 0);
     }

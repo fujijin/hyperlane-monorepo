@@ -14,19 +14,23 @@ pragma solidity >=0.8.0;
 @@@@@@@@@       @@@@@@@@*/
 
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 /**
  * @title AbstractOffchainQuoter
  * @notice Mixin for offchain-signed fee quotes with EIP-712 verification.
- * @dev No storage of its own — safe to mix into upgradeable contracts.
+ * @dev Uses ERC-7201 namespaced storage for the signer set to avoid
+ *      storage layout conflicts in upgradeable contracts.
  *      Concrete contracts define their own stored quote types and transient variables.
  */
 abstract contract AbstractOffchainQuoter {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
     // ============ Constants ============
 
     bytes32 public constant SIGNED_QUOTE_TYPEHASH =
         keccak256(
-            "SignedQuote(bytes context,bytes32 data,uint48 issuedAt,uint48 expiry)"
+            "SignedQuote(bytes context,bytes data,uint48 issuedAt,uint48 expiry,bytes32 salt,address submitter)"
         );
 
     bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
@@ -41,9 +45,32 @@ abstract contract AbstractOffchainQuoter {
 
     struct SignedQuote {
         bytes context;
-        bytes32 data;
+        bytes data;
         uint48 issuedAt;
         uint48 expiry; // == issuedAt means transient
+        bytes32 salt;
+        address submitter; // address(0) = unrestricted
+    }
+
+    // ============ ERC-7201 Namespaced Storage ============
+
+    /// @custom:storage-location erc7201:hyperlane.storage.AbstractOffchainQuoter
+    struct QuoterStorage {
+        EnumerableSet.AddressSet signers;
+    }
+
+    /// @dev keccak256(abi.encode(uint256(keccak256("hyperlane.storage.AbstractOffchainQuoter")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant QUOTER_STORAGE_LOCATION =
+        0x64f71a44403ec21f823dd9edb7275f10db1dce468c4e448159a561ce20e08a00;
+
+    function _getQuoterStorage()
+        private
+        pure
+        returns (QuoterStorage storage $)
+    {
+        assembly {
+            $.slot := QUOTER_STORAGE_LOCATION
+        }
     }
 
     // ============ Errors ============
@@ -51,16 +78,21 @@ abstract contract AbstractOffchainQuoter {
     error QuoteExpired();
     error StaleQuote();
     error InvalidSigner();
+    error InvalidSubmitter();
 
     // ============ Events ============
 
     event QuoteSubmitted(
         bytes context,
-        bytes32 data,
+        bytes data,
         uint48 issuedAt,
         uint48 expiry,
-        bool isTransient
+        bytes32 salt,
+        address submitter
     );
+
+    event QuoteSignerAdded(address signer);
+    event QuoteSignerRemoved(address signer);
 
     // ============ External ============
 
@@ -69,6 +101,8 @@ abstract contract AbstractOffchainQuoter {
         bytes calldata signature
     ) external {
         if (uint48(block.timestamp) > sq.expiry) revert QuoteExpired();
+        if (sq.submitter != address(0) && msg.sender != sq.submitter)
+            revert InvalidSubmitter();
         _verifyQuoteSigner(sq, signature);
 
         bool isTransient = sq.expiry == sq.issuedAt;
@@ -83,8 +117,33 @@ abstract contract AbstractOffchainQuoter {
             sq.data,
             sq.issuedAt,
             sq.expiry,
-            isTransient
+            sq.salt,
+            sq.submitter
         );
+    }
+
+    // ============ Views ============
+
+    function quoteSigners() external view returns (address[] memory) {
+        return _getQuoterStorage().signers.values();
+    }
+
+    function isQuoteSigner(address _signer) public view returns (bool) {
+        return _getQuoterStorage().signers.contains(_signer);
+    }
+
+    // ============ Internal ============
+
+    function _addQuoteSigner(address _signer) internal {
+        if (_getQuoterStorage().signers.add(_signer)) {
+            emit QuoteSignerAdded(_signer);
+        }
+    }
+
+    function _removeQuoteSigner(address _signer) internal {
+        if (_getQuoterStorage().signers.remove(_signer)) {
+            emit QuoteSignerRemoved(_signer);
+        }
     }
 
     // ============ Internal: EIP-712 ============
@@ -110,19 +169,21 @@ abstract contract AbstractOffchainQuoter {
             abi.encode(
                 SIGNED_QUOTE_TYPEHASH,
                 keccak256(sq.context),
-                sq.data,
+                keccak256(sq.data),
                 sq.issuedAt,
-                sq.expiry
+                sq.expiry,
+                sq.salt,
+                sq.submitter
             )
         );
         bytes32 digest = ECDSA.toTypedDataHash(_domainSeparator(), structHash);
         address signer = ECDSA.recover(digest, signature);
-        if (signer != _quoteSigner()) revert InvalidSigner();
+        if (!_getQuoterStorage().signers.contains(signer))
+            revert InvalidSigner();
     }
 
     // ============ Abstract ============
 
-    function _quoteSigner() internal view virtual returns (address);
     function _storeTransient(SignedQuote calldata sq) internal virtual;
     function _storeStanding(SignedQuote calldata sq) internal virtual;
 }

@@ -45,7 +45,7 @@ contract IGPOffchainQuotingTest is Test {
         _setGasConfig(DEST, oracle, GAS_OVERHEAD);
         _setOracleData(DEST, 1e10, 100); // 1.0 exchange, 100 wei gas price
 
-        igp.setOffchainQuoteSigner(signer);
+        igp.addQuoteSigner(signer);
     }
 
     // ============ Helpers ============
@@ -72,9 +72,11 @@ contract IGPOffchainQuotingTest is Test {
             abi.encode(
                 igp.SIGNED_QUOTE_TYPEHASH(),
                 keccak256(sq.context),
-                sq.data,
+                keccak256(sq.data),
                 sq.issuedAt,
-                sq.expiry
+                sq.expiry,
+                sq.salt,
+                sq.submitter
             )
         );
         bytes32 digest = ECDSA.toTypedDataHash(_domainSeparator(), structHash);
@@ -82,11 +84,11 @@ contract IGPOffchainQuotingTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    function _packGasData(
+    function _encodeGasData(
         uint128 rate,
         uint128 gasPrice
-    ) internal pure returns (bytes32) {
-        return bytes32((uint256(rate) << 128) | uint256(gasPrice));
+    ) internal pure returns (bytes memory) {
+        return abi.encode(rate, gasPrice);
     }
 
     function _igpContext(
@@ -114,9 +116,11 @@ contract IGPOffchainQuotingTest is Test {
         AbstractOffchainQuoter.SignedQuote memory sq = AbstractOffchainQuoter
             .SignedQuote({
                 context: _igpContext(feeToken, dest, sender_),
-                data: _packGasData(rate, gasPrice),
+                data: _encodeGasData(rate, gasPrice),
                 issuedAt: now_,
-                expiry: now_ // transient
+                expiry: now_, // transient
+                salt: bytes32(0),
+                submitter: address(0)
             });
         igp.submitQuote(sq, _signQuote(sq));
     }
@@ -138,9 +142,11 @@ contract IGPOffchainQuotingTest is Test {
                     dest,
                     sender_
                 ),
-                data: _packGasData(rate, gasPrice),
+                data: _encodeGasData(rate, gasPrice),
                 issuedAt: issuedAt,
-                expiry: expiry
+                expiry: expiry,
+                salt: bytes32(0),
+                submitter: address(0)
             });
         igp.submitQuote(sq, _signQuote(sq));
     }
@@ -400,9 +406,11 @@ contract IGPOffchainQuotingTest is Test {
                     DEST,
                     address(this)
                 ),
-                data: _packGasData(3e10, 200),
+                data: _encodeGasData(3e10, 200),
                 issuedAt: now_ - 1,
-                expiry: now_ + 7200
+                expiry: now_ + 7200,
+                salt: bytes32(0),
+                submitter: address(0)
             });
         bytes memory sig = _signQuote(sq);
         vm.expectRevert(AbstractOffchainQuoter.StaleQuote.selector);
@@ -482,18 +490,22 @@ contract IGPOffchainQuotingTest is Test {
                     DEST,
                     address(this)
                 ),
-                data: _packGasData(EXCHANGE_RATE, GAS_PRICE),
+                data: _encodeGasData(EXCHANGE_RATE, GAS_PRICE),
                 issuedAt: now_,
-                expiry: now_
+                expiry: now_,
+                salt: bytes32(0),
+                submitter: address(0)
             });
 
         bytes32 structHash = keccak256(
             abi.encode(
                 igp.SIGNED_QUOTE_TYPEHASH(),
                 keccak256(sq.context),
-                sq.data,
+                keccak256(sq.data),
                 sq.issuedAt,
-                sq.expiry
+                sq.expiry,
+                sq.salt,
+                sq.submitter
             )
         );
         bytes32 digest = ECDSA.toTypedDataHash(_domainSeparator(), structHash);
@@ -503,10 +515,10 @@ contract IGPOffchainQuotingTest is Test {
         igp.submitQuote(sq, abi.encodePacked(r, s, v));
     }
 
-    function test_setOffchainQuoteSigner_onlyOwner() public {
+    function test_addQuoteSigner_onlyOwner() public {
         vm.prank(address(0xBEEF));
         vm.expectRevert("Ownable: caller is not the owner");
-        igp.setOffchainQuoteSigner(address(0x123));
+        igp.addQuoteSigner(address(0x123));
     }
 
     // ============ Fee math ============
