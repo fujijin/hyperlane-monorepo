@@ -1,3 +1,7 @@
+## [2.3.0] - 2026-03-18
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+
 ## [2.2.0] - 2026-03-09
 
 * chore: migrate spellchecker from codespell to typos (#8214)

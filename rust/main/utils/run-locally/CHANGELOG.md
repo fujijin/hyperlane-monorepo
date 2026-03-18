@@ -1,3 +1,7 @@
+## [2.3.0] - 2026-03-18
+
+* fix(test): retry cosmos native e2e transactions to prevent flaky failures (#8354)
+
 ## [2.1.0] - 2026-03-04
 
 * feat(agents): add chain configuration metrics (#8185)
